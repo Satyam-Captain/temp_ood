@@ -1,0 +1,15 @@
+echo "=== HOST ==="
+hostname -f
+
+echo "=== LSF CLIENT ==="
+command -v bsub || echo "bsub not in PATH"
+command -v bjobs || echo "bjobs not in PATH"
+command -v lsid || echo "lsid not in PATH"
+
+echo "=== OOD CLUSTERS ==="
+ls -1 /etc/ood/config/clusters.d/
+
+echo "=== ADAPTER CONFIGURATION ==="
+grep -RinE \
+  'adapter:|submit_host:|bindir:|libdir:|envdir:|serverdir:|cluster:' \
+  /etc/ood/config/clusters.d/ 2>/dev/null

@@ -1,15 +1,12 @@
 echo "=== HOST ==="
 hostname -f
+whoami
 
-echo "=== LSF CLIENT ==="
-command -v bsub || echo "bsub not in PATH"
-command -v bjobs || echo "bjobs not in PATH"
-command -v lsid || echo "lsid not in PATH"
+echo "=== GRAPHICAL COMPONENTS ==="
+for cmd in vncserver tigervncserver Xvnc Xtigervnc \
+           websockify gnome-session openbox-session; do
+    command -v "$cmd" || echo "$cmd missing"
+done
 
-echo "=== OOD CLUSTERS ==="
-ls -1 /etc/ood/config/clusters.d/
-
-echo "=== ADAPTER CONFIGURATION ==="
-grep -RinE \
-  'adapter:|submit_host:|bindir:|libdir:|envdir:|serverdir:|cluster:' \
-  /etc/ood/config/clusters.d/ 2>/dev/null
+echo "=== SYSTEMD USER ==="
+systemctl --user status --no-pager

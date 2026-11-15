@@ -1,39 +1,21 @@
 APP="/var/www/ood/apps/sys/remote_gnome_multi"
-cp -p "$APP/config.ru" "$APP/config.ru.before-csrf-fix"
 
-python3 - <<'PY'
+sudo cp -p "$APP/config.ru" "$APP/config.ru.before-regex-fix"
+
+sudo python3 - <<'PY'
 from pathlib import Path
 
 p = Path("/var/www/ood/apps/sys/remote_gnome_multi/config.ru")
 s = p.read_text()
 
-old = "CSRF_TOKEN = SecureRandom.hex(32)"
+wrong = r"/\\A[0-9a-f]{64}\\z/"
+correct = r"/\A[0-9a-f]{64}\z/"
 
-new = """require 'fileutils'
+if s.count(wrong) != 1:
+    raise SystemExit("Expected escaping error not found; file unchanged.")
 
-csrf_dir = File.join(Dir.home, '.local', 'state', 'ood-gnome-web')
-FileUtils.mkdir_p(csrf_dir)
-File.chmod(0700, csrf_dir)
-
-csrf_file = File.join(csrf_dir, 'csrf_token')
-
-File.open(csrf_file + '.lock', File::RDWR | File::CREAT, 0600) do |lock|
-  lock.flock(File::LOCK_EX)
-
-  unless File.file?(csrf_file)
-    File.open(csrf_file, File::WRONLY | File::CREAT | File::EXCL, 0600) do |f|
-      f.write(SecureRandom.hex(32))
-    end
-  end
-end
-
-CSRF_TOKEN = File.read(csrf_file).strip
-raise 'Invalid CSRF token' unless CSRF_TOKEN.match?(/\\\\A[0-9a-f]{64}\\\\z/)
-"""
-
-assert s.count(old) == 1, "Expected token definition not found"
-p.write_text(s.replace(old, new, 1))
-print("CSRF handling updated")
+p.write_text(s.replace(wrong, correct, 1))
+print("CSRF regex corrected")
 PY
 
 ruby -c "$APP/config.ru"

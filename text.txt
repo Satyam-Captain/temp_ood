@@ -1,3 +1,163 @@
+#!/usr/bin/env bash
+# OOD GNOME multi-user POC: one independent desktop per Linux account.
+# Must be executed as the target user, never via sudo/root.
+set -Eeuo pipefail
+umask 077
+
+# CONFIGURE ONCE. Use only an approved network-facing WebSocket listener.
+WEBSOCKIFY_RUN='[WEBSOCKIFY_RUN_ABSOLUTE_PATH]'
+WS_BIND_IP='[DESKTOP_PRIVATE_IP]'
+WS_PORTS=(6081)  # Add only further ports explicitly approved for OOD -> desktop.
+
+XVNC=/usr/bin/Xvnc
+VNCPASSWD=/usr/bin/vncpasswd
+SS=/usr/sbin/ss
+TMUX=/usr/bin/tmux
+DBUS_RUN=/usr/bin/dbus-run-session
+GNOME=/usr/bin/gnome-session
+SELF=$(readlink -f -- "$0")
+
+ROOT="$HOME/.local/state/ood-gnome-v2"
+LOGS="$ROOT/logs"
+ALLOC="$ROOT/allocation"              # Existing v2 format: display vnc-port
+WS_ALLOC="$ROOT/websocket_port"
+PASS="$ROOT/password"                 # Plain VNC password, never share
+PASSFILE="$ROOT/vnc.passwd"           # VNC authentication file
+SOCKET=ood_gnome_v2
+SESSION=desktop
+XVNC_PID=''
+GNOME_PID=''
+WS_PID=''
+
+mkdir -p -m 700 "$ROOT" "$LOGS"
+chmod 700 "$ROOT" "$LOGS"
+[[ $(id -u) -ne 0 ]] || { echo 'Refusing to run as root'; exit 1; }
+
+listening() {
+  "$SS" -H -ltn "( sport = :$1 )" | grep -q .
+}
+
+owned_rmdir() {
+  local dir=$1
+  if [[ -d "$dir" ]] && [[ $(stat -c '%u' -- "$dir") == "$(id -u)" ]]; then
+    rmdir -- "$dir" 2>/dev/null || true
+  fi
+}
+
+display_lock() { printf '/tmp/ood-gnome-v2-display-%s' "$1"; }
+ws_lock() { printf '/tmp/ood-gnome-v2-websocket-%s' "$1"; }
+
+load_allocation() {
+  [[ -f "$ALLOC" ]] || return 1
+  read -r DISPLAY_NO VNC_PORT < "$ALLOC" || return 1
+  [[ "$DISPLAY_NO" =~ ^[0-9]+$ && "$VNC_PORT" =~ ^[0-9]+$ ]] || return 1
+  (( DISPLAY_NO >= 40 && DISPLAY_NO <= 79 )) || return 1
+  (( VNC_PORT == DISPLAY_NO + 5900 )) || return 1
+}
+
+load_ws() {
+  [[ -f "$WS_ALLOC" ]] || return 1
+  read -r WS_PORT < "$WS_ALLOC" || return 1
+  [[ "$WS_PORT" =~ ^[0-9]+$ ]] || return 1
+}
+
+check_tools() {
+  local cmd
+  for cmd in "$XVNC" "$VNCPASSWD" "$SS" "$TMUX" "$DBUS_RUN" "$GNOME" "$WEBSOCKIFY_RUN"; do
+    [[ -x "$cmd" ]] || { echo "Missing/not executable: $cmd"; return 1; }
+  done
+  [[ "$WS_BIND_IP" != '[DESKTOP_PRIVATE_IP]' ]] || {
+    echo 'Configure the approved WS_BIND_IP first'; return 1;
+  }
+  [[ "$WEBSOCKIFY_RUN" != '[WEBSOCKIFY_RUN_ABSOLUTE_PATH]' ]] || {
+    echo 'Configure WEBSOCKIFY_RUN first'; return 1;
+  }
+}
+
+reserve_display() {
+  if [[ -f "$ALLOC" ]]; then
+    load_allocation || { echo 'Invalid existing allocation; inspect privately'; return 1; }
+    [[ $(stat -c '%u' -- "$(display_lock "$DISPLAY_NO")" 2>/dev/null || echo missing) == "$(id -u)" ]] || {
+      echo 'Existing display reservation missing or not owned by this user'; return 1;
+    }
+    return 0
+  fi
+  local d p lock
+  for d in $(seq 40 79); do
+    p=$((5900+d))
+    lock=$(display_lock "$d")
+    mkdir -m 700 -- "$lock" 2>/dev/null || continue
+    if [[ -e "/tmp/.X${d}-lock" || -e "/tmp/.X11-unix/X${d}" ]] || listening "$p"; then
+      owned_rmdir "$lock"
+      continue
+    fi
+    DISPLAY_NO=$d
+    VNC_PORT=$p
+    printf '%s %s\n' "$d" "$p" > "$ALLOC"
+    return 0
+  done
+  echo 'No free X display in the configured range'; return 1
+}
+
+reserve_ws() {
+  if [[ -f "$WS_ALLOC" ]]; then
+    load_ws || { echo 'Invalid existing WebSocket reservation'; return 1; }
+    [[ $(stat -c '%u' -- "$(ws_lock "$WS_PORT")" 2>/dev/null || echo missing) == "$(id -u)" ]] || {
+      echo 'Existing WebSocket reservation missing or not owned'; return 1;
+    }
+    return 0
+  fi
+  local p lock
+  for p in "${WS_PORTS[@]}"; do
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    lock=$(ws_lock "$p")
+    mkdir -m 700 -- "$lock" 2>/dev/null || continue
+    if listening "$p"; then
+      owned_rmdir "$lock"
+      continue
+    fi
+    WS_PORT=$p
+    printf '%s\n' "$p" > "$WS_ALLOC"
+    return 0
+  done
+  echo 'No approved WebSocket port available. Do not choose unapproved ports.'
+  return 1
+}
+
+show_status() {
+  if "$TMUX" -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+    echo 'TMUX_SESSION_RUNNING'
+  else
+    echo 'TMUX_SESSION_NOT_RUNNING'
+  fi
+  if load_allocation; then
+    echo "DISPLAY=:$DISPLAY_NO VNC_PORT=$VNC_PORT"
+    if listening "$VNC_PORT"; then echo 'XVNC_LISTENING'; else echo 'XVNC_NOT_LISTENING'; fi
+  else
+    echo 'NO_DISPLAY_ALLOCATION'
+  fi
+  if load_ws; then
+    echo "WEBSOCKET_PORT=$WS_PORT"
+    if listening "$WS_PORT"; then echo 'WEBSOCKET_LISTENING'; else echo 'WEBSOCKET_NOT_LISTENING'; fi
+  else
+    echo 'NO_WEBSOCKET_ALLOCATION'
+  fi
+}
+
+# Signals and normal exit clean up only the subprocesses owned by this worker.
+worker_cleanup() {
+  trap - EXIT HUP INT TERM
+  [[ -z "$WS_PID" ]] || kill -TERM "$WS_PID" 2>/dev/null || true
+  [[ -z "$GNOME_PID" ]] || kill -TERM "$GNOME_PID" 2>/dev/null || true
+  [[ -z "$XVNC_PID" ]] || kill -TERM "$XVNC_PID" 2>/dev/null || true
+  rm -f "$ROOT/worker.pid"
+}
+
+# Called only by this user's detached tmux session.
+worker() {
+  check_tools
+  load_allocation && load_ws || { echo 'Missing resource allocation'; exit 1; }
+  trap worker_cleanup EXIT HUP INT TERM
   printf '%s\n' "$$" > "$ROOT/worker.pid"
 
   "$XVNC" ":$DISPLAY_NO" -geometry 1280x800 -depth 24 \

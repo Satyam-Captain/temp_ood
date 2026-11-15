@@ -1,24 +1,27 @@
-mkdir -p "$HOME/ondemand/dev/remote_gnome_launcher"
-
-cd "$HOME/ondemand/dev/remote_gnome_launcher"
-
-cat > manifest.yml <<'EOF'
----
-name: Remote GNOME Launcher
-category: Interactive Apps
-subcategory: Desktops
-description: Manage a remote GNOME desktop session
-EOF
-
 cat > config.ru <<'EOF'
+require 'open3'
+
 run lambda { |env|
+  stdout, stderr, status = Open3.capture3(
+    'ssh',
+    '-T',
+    '-o', 'BatchMode=yes',
+    '-o', 'StrictHostKeyChecking=yes',
+    '-o', 'ConnectTimeout=5',
+    '[USERNAME]@[DESKTOP_HOST]',
+    '/usr/bin/id', '-un'
+  )
+
+  result = if status.success?
+    "PASS: Remote SSH execution succeeded"
+  else
+    "FAIL: Remote SSH execution failed (exit #{status.exitstatus})"
+  end
+
   [
     200,
-    { "Content-Type" => "text/html; charset=utf-8" },
-    [
-      "<h2>Remote GNOME Launcher</h2>" \
-      "<p>OOD application backend is working.</p>"
-    ]
+    { 'Content-Type' => 'text/html; charset=utf-8' },
+    ["<h2>Remote GNOME Launcher</h2><p>#{result}</p>"]
   ]
 }
 EOF

@@ -1,286 +1,596 @@
+BASE="[SHARED_APP_ROOT]/ood-gnome"
+
+cat > "$BASE/bin/desktop.conf" <<'EOF'
+# Open OnDemand GNOME — Shared Configuration
+
+# Absolute path to the websockify run executable
+WEBSOCKIFY_RUN='[ABSOLUTE_PATH_TO_WEBSOCKIFY_RUN]'
+
+# Approved desktop-host network interface
+WS_BIND_IP='[APPROVED_DESKTOP_IPV4]'
+
+# WebSocket ports reserved for the three-user POC
+WS_PORTS='6081 6082 6083'
+EOF
+
+
+------
+
+BASE="[SHARED_APP_ROOT]/ood-gnome"
+
+cat > "$BASE/bin/desktopctl" <<'EOF'
 #!/usr/bin/env bash
-# OOD GNOME multi-user POC: one independent desktop per Linux account.
-# Must be executed as the target user, never via sudo/root.
 set -Eeuo pipefail
 umask 077
 
-# CONFIGURE ONCE. Use only an approved network-facing WebSocket listener.
-WEBSOCKIFY_RUN='[WEBSOCKIFY_RUN_ABSOLUTE_PATH]'
-WS_BIND_IP='[DESKTOP_PRIVATE_IP]'
-WS_PORTS=(6081)  # Add only further ports explicitly approved for OOD -> desktop.
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
+# Shared administrator-maintained configuration
+SELF=$(readlink -f "$0")
+CONF="$(dirname "$SELF")/desktop.conf"
+
+[[ -r "$CONF" ]] || {
+  echo "CONFIG_NOT_READABLE"
+  exit 1
+}
+
+source "$CONF"
+
+: "${WEBSOCKIFY_RUN:?}"
+: "${WS_BIND_IP:?}"
+: "${WS_PORTS:?}"
+
+[[ "$WEBSOCKIFY_RUN" != *'['* && "$WS_BIND_IP" != *'['* ]] || {
+  echo "CONFIG_NOT_SET"
+  exit 1
+}
+
+[[ $(id -u) -ne 0 ]] || {
+  echo "DO_NOT_RUN_AS_ROOT"
+  exit 1
+}
+
+# Executables
 XVNC=/usr/bin/Xvnc
 VNCPASSWD=/usr/bin/vncpasswd
-SS=/usr/sbin/ss
 TMUX=/usr/bin/tmux
-DBUS_RUN=/usr/bin/dbus-run-session
+DBUS=/usr/bin/dbus-run-session
 GNOME=/usr/bin/gnome-session
-SELF=$(readlink -f -- "$0")
+SS=/usr/sbin/ss
+PYTHON=$(command -v python3)
 
-ROOT="$HOME/.local/state/ood-gnome-v2"
-LOGS="$ROOT/logs"
-ALLOC="$ROOT/allocation"              # Existing v2 format: display vnc-port
-WS_ALLOC="$ROOT/websocket_port"
-PASS="$ROOT/password"                 # Plain VNC password, never share
-PASSFILE="$ROOT/vnc.passwd"           # VNC authentication file
-SOCKET=ood_gnome_v2
-SESSION=desktop
-XVNC_PID=''
-GNOME_PID=''
-WS_PID=''
+# Private user data
+STATE="$HOME/.local/state/ood-gnome-multi"
+LOGS="$STATE/logs"
 
-mkdir -p -m 700 "$ROOT" "$LOGS"
-chmod 700 "$ROOT" "$LOGS"
-[[ $(id -u) -ne 0 ]] || { echo 'Refusing to run as root'; exit 1; }
+ALLOC="$STATE/allocation"
+WSALLOC="$STATE/ws_port"
 
-listening() {
+SOCKET="ood_gnome_multi"
+SESSION="desktop"
+
+DISPLAY_NO=""
+VNC_PORT=""
+WS_PORT=""
+
+XVNC_PID=""
+GNOME_PID=""
+WS_PID=""
+
+mkdir -p -m 700 "$STATE" "$LOGS"
+chmod 700 "$STATE" "$LOGS"
+
+# ---------------------------------------
+# Common helpers
+# ---------------------------------------
+
+listen_port() {
   "$SS" -H -ltn "( sport = :$1 )" | grep -q .
 }
 
-owned_rmdir() {
-  local dir=$1
-  if [[ -d "$dir" ]] && [[ $(stat -c '%u' -- "$dir") == "$(id -u)" ]]; then
-    rmdir -- "$dir" 2>/dev/null || true
+display_lock() {
+  echo "/tmp/ood-gnome-multi-display-$1"
+}
+
+ws_lock() {
+  echo "/tmp/ood-gnome-multi-ws-$1"
+}
+
+release_lock() {
+  local path="$1"
+  local owner
+
+  [[ -d "$path" ]] || return 0
+
+  owner=$(stat -c '%u' "$path" 2>/dev/null || echo unknown)
+
+  if [[ "$owner" == "$(id -u)" ]]; then
+    rmdir "$path" 2>/dev/null || true
   fi
-}
-
-display_lock() { printf '/tmp/ood-gnome-v2-display-%s' "$1"; }
-ws_lock() { printf '/tmp/ood-gnome-v2-websocket-%s' "$1"; }
-
-load_allocation() {
-  [[ -f "$ALLOC" ]] || return 1
-  read -r DISPLAY_NO VNC_PORT < "$ALLOC" || return 1
-  [[ "$DISPLAY_NO" =~ ^[0-9]+$ && "$VNC_PORT" =~ ^[0-9]+$ ]] || return 1
-  (( DISPLAY_NO >= 40 && DISPLAY_NO <= 79 )) || return 1
-  (( VNC_PORT == DISPLAY_NO + 5900 )) || return 1
-}
-
-load_ws() {
-  [[ -f "$WS_ALLOC" ]] || return 1
-  read -r WS_PORT < "$WS_ALLOC" || return 1
-  [[ "$WS_PORT" =~ ^[0-9]+$ ]] || return 1
 }
 
 check_tools() {
-  local cmd
-  for cmd in "$XVNC" "$VNCPASSWD" "$SS" "$TMUX" "$DBUS_RUN" "$GNOME" "$WEBSOCKIFY_RUN"; do
-    [[ -x "$cmd" ]] || { echo "Missing/not executable: $cmd"; return 1; }
+  local executable
+
+  for executable in \
+    "$XVNC" "$VNCPASSWD" "$TMUX" \
+    "$DBUS" "$GNOME" "$SS" \
+    "$WEBSOCKIFY_RUN" "$PYTHON"
+  do
+    [[ -x "$executable" ]] || {
+      echo "MISSING_EXECUTABLE: $executable"
+      return 1
+    }
   done
-  [[ "$WS_BIND_IP" != '[DESKTOP_PRIVATE_IP]' ]] || {
-    echo 'Configure the approved WS_BIND_IP first'; return 1;
+
+  [[ "$WS_BIND_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo "INVALID_BIND_IP"
+    return 1
   }
-  [[ "$WEBSOCKIFY_RUN" != '[WEBSOCKIFY_RUN_ABSOLUTE_PATH]' ]] || {
-    echo 'Configure WEBSOCKIFY_RUN first'; return 1;
+
+  [[ "$WS_PORTS" =~ ^[0-9]{4,5}(\ [0-9]{4,5})*$ ]] || {
+    echo "INVALID_WS_PORT_LIST"
+    return 1
   }
 }
+
+load_display() {
+  [[ -r "$ALLOC" ]] || return 1
+
+  read -r DISPLAY_NO VNC_PORT < "$ALLOC"
+
+  [[ "$DISPLAY_NO" =~ ^[0-9]+$ &&
+     "$VNC_PORT" =~ ^[0-9]+$ ]] || return 1
+
+  (( DISPLAY_NO >= 40 &&
+     DISPLAY_NO <= 79 &&
+     VNC_PORT == DISPLAY_NO + 5900 ))
+}
+
+load_ws() {
+  [[ -r "$WSALLOC" ]] || return 1
+
+  read -r WS_PORT < "$WSALLOC"
+
+  [[ "$WS_PORT" =~ ^[0-9]+$ ]] || return 1
+
+  [[ " $WS_PORTS " == *" $WS_PORT "* ]]
+}
+
+tmux_alive() {
+  "$TMUX" -L "$SOCKET" has-session \
+    -t "$SESSION" 2>/dev/null
+}
+
+# ---------------------------------------
+# Allocate display and VNC port
+# ---------------------------------------
 
 reserve_display() {
-  if [[ -f "$ALLOC" ]]; then
-    load_allocation || { echo 'Invalid existing allocation; inspect privately'; return 1; }
-    [[ $(stat -c '%u' -- "$(display_lock "$DISPLAY_NO")" 2>/dev/null || echo missing) == "$(id -u)" ]] || {
-      echo 'Existing display reservation missing or not owned by this user'; return 1;
-    }
-    return 0
-  fi
-  local d p lock
-  for d in $(seq 40 79); do
-    p=$((5900+d))
-    lock=$(display_lock "$d")
-    mkdir -m 700 -- "$lock" 2>/dev/null || continue
-    if [[ -e "/tmp/.X${d}-lock" || -e "/tmp/.X11-unix/X${d}" ]] || listening "$p"; then
-      owned_rmdir "$lock"
-      continue
-    fi
-    DISPLAY_NO=$d
-    VNC_PORT=$p
-    printf '%s %s\n' "$d" "$p" > "$ALLOC"
-    return 0
-  done
-  echo 'No free X display in the configured range'; return 1
-}
+  local d port lock
 
-reserve_ws() {
-  if [[ -f "$WS_ALLOC" ]]; then
-    load_ws || { echo 'Invalid existing WebSocket reservation'; return 1; }
-    [[ $(stat -c '%u' -- "$(ws_lock "$WS_PORT")" 2>/dev/null || echo missing) == "$(id -u)" ]] || {
-      echo 'Existing WebSocket reservation missing or not owned'; return 1;
+  if [[ -f "$ALLOC" ]]; then
+    load_display || return 1
+
+    [[ $(stat -c '%u' "$(display_lock "$DISPLAY_NO")" \
+      2>/dev/null || echo missing) == "$(id -u)" ]] || {
+      echo "DISPLAY_LOCK_NOT_OWNED"
+      return 1
     }
+
     return 0
   fi
-  local p lock
-  for p in "${WS_PORTS[@]}"; do
-    [[ "$p" =~ ^[0-9]+$ ]] || continue
-    lock=$(ws_lock "$p")
-    mkdir -m 700 -- "$lock" 2>/dev/null || continue
-    if listening "$p"; then
-      owned_rmdir "$lock"
+
+  for d in $(seq 40 79); do
+    port=$((5900 + d))
+    lock=$(display_lock "$d")
+
+    # Preserve reservations belonging to the old v2 POC.
+    [[ ! -e "/tmp/ood-gnome-v2-display-$d" ]] || continue
+
+    mkdir -m 700 "$lock" 2>/dev/null || continue
+
+    if [[ -e "/tmp/.X${d}-lock" ||
+          -e "/tmp/.X11-unix/X${d}" ]] ||
+       listen_port "$port"; then
+
+      release_lock "$lock"
       continue
     fi
-    WS_PORT=$p
-    printf '%s\n' "$p" > "$WS_ALLOC"
+
+    DISPLAY_NO="$d"
+    VNC_PORT="$port"
+
+    printf '%s %s\n' "$d" "$port" > "$ALLOC"
+
     return 0
   done
-  echo 'No approved WebSocket port available. Do not choose unapproved ports.'
+
+  echo "NO_FREE_DISPLAY"
   return 1
 }
 
-show_status() {
-  if "$TMUX" -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
-    echo 'TMUX_SESSION_RUNNING'
-  else
-    echo 'TMUX_SESSION_NOT_RUNNING'
+# ---------------------------------------
+# Allocate WebSocket port
+# ---------------------------------------
+
+reserve_ws() {
+  local port lock
+
+  if [[ -f "$WSALLOC" ]]; then
+    load_ws || return 1
+
+    [[ $(stat -c '%u' "$(ws_lock "$WS_PORT")" \
+      2>/dev/null || echo missing) == "$(id -u)" ]] || {
+      echo "WS_LOCK_NOT_OWNED"
+      return 1
+    }
+
+    return 0
   fi
-  if load_allocation; then
-    echo "DISPLAY=:$DISPLAY_NO VNC_PORT=$VNC_PORT"
-    if listening "$VNC_PORT"; then echo 'XVNC_LISTENING'; else echo 'XVNC_NOT_LISTENING'; fi
+
+  for port in $WS_PORTS; do
+    lock=$(ws_lock "$port")
+
+    # Avoid ports reserved by the earlier POC.
+    [[ ! -e "/tmp/ood-gnome-v2-websocket-$port" ]] || continue
+
+    mkdir -m 700 "$lock" 2>/dev/null || continue
+
+    if listen_port "$port"; then
+      release_lock "$lock"
+      continue
+    fi
+
+    WS_PORT="$port"
+    printf '%s\n' "$port" > "$WSALLOC"
+
+    return 0
+  done
+
+  echo "NO_FREE_WEBSOCKET_PORT"
+  return 1
+}
+
+# ---------------------------------------
+# Status and readiness
+# ---------------------------------------
+
+ready() {
+  load_display &&
+  load_ws &&
+  tmux_alive &&
+  listen_port "$VNC_PORT" &&
+  listen_port "$WS_PORT"
+}
+
+status() {
+  echo "USER=$(id -un)"
+  echo "UID=$(id -u)"
+
+  if tmux_alive; then
+    echo "TMUX_RUNNING"
   else
-    echo 'NO_DISPLAY_ALLOCATION'
+    echo "TMUX_NOT_RUNNING"
   fi
+
+  if load_display; then
+    echo "DISPLAY=:$DISPLAY_NO"
+    echo "VNC_PORT=$VNC_PORT"
+
+    if listen_port "$VNC_PORT"; then
+      echo "XVNC_LISTENING"
+    else
+      echo "XVNC_NOT_LISTENING"
+    fi
+  else
+    echo "NO_DISPLAY_ALLOCATION"
+  fi
+
   if load_ws; then
     echo "WEBSOCKET_PORT=$WS_PORT"
-    if listening "$WS_PORT"; then echo 'WEBSOCKET_LISTENING'; else echo 'WEBSOCKET_NOT_LISTENING'; fi
+
+    if listen_port "$WS_PORT"; then
+      echo "WEBSOCKET_LISTENING"
+    else
+      echo "WEBSOCKET_NOT_LISTENING"
+    fi
   else
-    echo 'NO_WEBSOCKET_ALLOCATION'
+    echo "NO_WEBSOCKET_ALLOCATION"
+  fi
+
+  if ready; then
+    echo "DESKTOP_NETWORK_READY"
+  else
+    echo "DESKTOP_NOT_READY"
   fi
 }
 
-# Signals and normal exit clean up only the subprocesses owned by this worker.
+# ---------------------------------------
+# Desktop worker
+# ---------------------------------------
+
 worker_cleanup() {
   trap - EXIT HUP INT TERM
-  [[ -z "$WS_PID" ]] || kill -TERM "$WS_PID" 2>/dev/null || true
-  [[ -z "$GNOME_PID" ]] || kill -TERM "$GNOME_PID" 2>/dev/null || true
-  [[ -z "$XVNC_PID" ]] || kill -TERM "$XVNC_PID" 2>/dev/null || true
-  rm -f "$ROOT/worker.pid"
+
+  [[ -z "$WS_PID" ]] ||
+    kill -TERM "$WS_PID" 2>/dev/null || true
+
+  [[ -z "$GNOME_PID" ]] ||
+    kill -TERM "$GNOME_PID" 2>/dev/null || true
+
+  [[ -z "$XVNC_PID" ]] ||
+    kill -TERM "$XVNC_PID" 2>/dev/null || true
+
+  rm -f "$STATE/worker.pid"
 }
 
-# Called only by this user's detached tmux session.
 worker() {
   check_tools
-  load_allocation && load_ws || { echo 'Missing resource allocation'; exit 1; }
-  trap worker_cleanup EXIT HUP INT TERM
-  printf '%s\n' "$$" > "$ROOT/worker.pid"
 
-  "$XVNC" ":$DISPLAY_NO" -geometry 1280x800 -depth 24 \
-    -localhost -SecurityTypes VncAuth -rfbauth "$PASSFILE" \
-    -rfbport "$VNC_PORT" > "$LOGS/xvnc.log" 2>&1 &
+  load_display && load_ws || {
+    echo "ALLOCATION_MISSING"
+    return 1
+  }
+
+  trap worker_cleanup EXIT
+  trap 'exit 143' HUP INT TERM
+
+  echo "$$" > "$STATE/worker.pid"
+
+  # Start Xvnc
+  "$XVNC" ":$DISPLAY_NO" \
+    -geometry 1280x800 \
+    -depth 24 \
+    -localhost \
+    -SecurityTypes VncAuth \
+    -rfbauth "$STATE/vnc.passwd" \
+    -rfbport "$VNC_PORT" \
+    > "$LOGS/xvnc.log" 2>&1 &
+
   XVNC_PID=$!
-  printf '%s\n' "$XVNC_PID" > "$ROOT/xvnc.pid"
-  sleep 2
-  kill -0 "$XVNC_PID" 2>/dev/null || { echo 'Xvnc exited; inspect xvnc.log'; return 1; }
+  echo "$XVNC_PID" > "$STATE/xvnc.pid"
 
-  DISPLAY=":$DISPLAY_NO" XDG_SESSION_TYPE=x11 \
-    "$DBUS_RUN" -- "$GNOME" > "$LOGS/gnome.log" 2>&1 &
+  sleep 2
+
+  kill -0 "$XVNC_PID" 2>/dev/null || {
+    echo "XVNC_START_FAILED"
+    return 1
+  }
+
+  # Start GNOME
+  DISPLAY=":$DISPLAY_NO" \
+  XDG_SESSION_TYPE=x11 \
+    "$DBUS" -- "$GNOME" \
+    > "$LOGS/gnome.log" 2>&1 &
+
   GNOME_PID=$!
-  printf '%s\n' "$GNOME_PID" > "$ROOT/gnome.pid"
+  echo "$GNOME_PID" > "$STATE/gnome.pid"
 
-  "$WEBSOCKIFY_RUN" "$WS_BIND_IP:$WS_PORT" "127.0.0.1:$VNC_PORT" \
+  # Start websockify
+  "$WEBSOCKIFY_RUN" \
+    "$WS_BIND_IP:$WS_PORT" \
+    "127.0.0.1:$VNC_PORT" \
     > "$LOGS/websockify.log" 2>&1 &
-  WS_PID=$!
-  printf '%s\n' "$WS_PID" > "$ROOT/websockify.pid"
-  sleep 2
-  kill -0 "$WS_PID" 2>/dev/null || { echo 'websockify exited; inspect websockify.log'; return 1; }
 
-  while kill -0 "$XVNC_PID" 2>/dev/null && \
-        kill -0 "$GNOME_PID" 2>/dev/null && \
-        kill -0 "$WS_PID" 2>/dev/null; do
+  WS_PID=$!
+  echo "$WS_PID" > "$STATE/websockify.pid"
+
+  sleep 2
+
+  kill -0 "$WS_PID" 2>/dev/null || {
+    echo "WEBSOCKIFY_START_FAILED"
+    return 1
+  }
+
+  # Keep the session alive while the components run.
+  while kill -0 "$XVNC_PID" 2>/dev/null &&
+        kill -0 "$GNOME_PID" 2>/dev/null &&
+        kill -0 "$WS_PID" 2>/dev/null
+  do
     sleep 3
   done
-  echo 'One desktop component exited; stopping the others'
+
+  echo "DESKTOP_COMPONENT_EXITED"
 }
 
-# The stop command only signals PIDs belonging to the current user and matching
-# our own known command lines. It never uses a broad pkill pattern.
-stop_owned_pid() {
-  local file=$1 match=$2 pid args uid
-  [[ -f "$file" ]] || return 0
+# ---------------------------------------
+# Process termination helper
+# ---------------------------------------
+
+stop_pid() {
+  local file="$1"
+  local expected="$2"
+  local pid uid args
+
+  [[ -r "$file" ]] || return 0
+
   read -r pid < "$file" || return 0
+
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+
   uid=$(ps -p "$pid" -o uid= 2>/dev/null | tr -d ' ' || true)
   args=$(ps -p "$pid" -o args= 2>/dev/null || true)
-  if [[ "$uid" == "$(id -u)" && "$args" == *"$match"* ]]; then
+
+  if [[ "$uid" == "$(id -u)" &&
+        "$args" == *"$expected"* ]]; then
+
     kill -TERM "$pid" 2>/dev/null || true
   fi
 }
 
-release_reservations() {
-  if load_allocation; then
-    if listening "$VNC_PORT" || [[ -e "/tmp/.X11-unix/X$DISPLAY_NO" || -e "/tmp/.X${DISPLAY_NO}-lock" ]]; then
-      echo 'VNC display still in use; allocation retained'; return 1
+# ---------------------------------------
+# Release reserved resources
+# ---------------------------------------
+
+release() {
+  if tmux_alive; then
+    echo "SESSION_ACTIVE_STOP_FIRST"
+    return 1
+  fi
+
+  if load_display; then
+    if listen_port "$VNC_PORT" ||
+       [[ -e "/tmp/.X${DISPLAY_NO}-lock" ||
+          -e "/tmp/.X11-unix/X${DISPLAY_NO}" ]]; then
+
+      echo "DISPLAY_STILL_BUSY"
+      return 1
     fi
   fi
-  if load_ws && listening "$WS_PORT"; then
-    echo 'WebSocket port still in use; allocation retained'; return 1
+
+  if load_ws && listen_port "$WS_PORT"; then
+    echo "WEBSOCKET_STILL_BUSY"
+    return 1
   fi
-  if load_allocation; then
-    owned_rmdir "$(display_lock "$DISPLAY_NO")"
+
+  if load_display; then
+    release_lock "$(display_lock "$DISPLAY_NO")"
     rm -f "$ALLOC"
   fi
+
   if load_ws; then
-    owned_rmdir "$(ws_lock "$WS_PORT")"
-    rm -f "$WS_ALLOC"
+    release_lock "$(ws_lock "$WS_PORT")"
+    rm -f "$WSALLOC"
   fi
-  rm -f "$ROOT/xvnc.pid" "$ROOT/gnome.pid" "$ROOT/websockify.pid" "$ROOT/worker.pid"
-  echo 'RESERVATIONS_RELEASED'
+
+  rm -f \
+    "$STATE/worker.pid" \
+    "$STATE/xvnc.pid" \
+    "$STATE/gnome.pid" \
+    "$STATE/websockify.pid" \
+    "$STATE/password" \
+    "$STATE/vnc.passwd"
+
+  echo "RESERVATIONS_RELEASED"
 }
 
+# ---------------------------------------
+# Main command dispatcher
+# ---------------------------------------
+
 case "${1:-}" in
+
+  worker)
+    worker
+    ;;
+
   start)
     check_tools
-    if "$TMUX" -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
-      echo 'DESKTOP_ALREADY_RUNNING'
-      show_status
-      exit 0
-    fi
-    mkdir -m 700 "$ROOT/.starting" 2>/dev/null || { echo 'Concurrent start or stale start lock'; exit 1; }
-    trap 'rmdir "$ROOT/.starting" 2>/dev/null || true' EXIT
-    reserve_display
-    if listening "$VNC_PORT" || [[ -e "/tmp/.X${DISPLAY_NO}-lock" || -e "/tmp/.X11-unix/X${DISPLAY_NO}" ]]; then
-      echo 'Reserved VNC display is already in use; refusing to alter its credentials'
-      exit 1
-    fi
-    reserve_ws
-    python3 -c 'import secrets,string; a=string.ascii_letters+string.digits; print("".join(secrets.choice(a) for _ in range(8)))' > "$PASS"
-    "$VNCPASSWD" -f < "$PASS" > "$PASSFILE"
-    chmod 600 "$PASS" "$PASSFILE"
-    printf 'host: %s\nport: %s\ndisplay: %s\nwebsocket: %s\n' \
-      "$(hostname -f)" "$VNC_PORT" "$DISPLAY_NO" "$WS_PORT" > "$ROOT/connection.yml"
-    chmod 600 "$ROOT/connection.yml"
-    # tmux 1.8 accepts the shell command as one argument.
-    "$TMUX" -L "$SOCKET" new-session -d -s "$SESSION" \
-      "/bin/bash \"$SELF\" worker >> \"$LOGS/worker.log\" 2>&1"
-    for _ in $(seq 1 25); do
-      if listening "$VNC_PORT" && listening "$WS_PORT"; then
-        echo 'DESKTOP_NETWORK_READY (GNOME may still be initializing)'
-        show_status
+
+    if tmux_alive; then
+      if ready; then
+        echo "DESKTOP_ALREADY_RUNNING"
+        status
         exit 0
       fi
-      if ! "$TMUX" -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
-        echo "Desktop worker exited. Inspect $LOGS/worker.log"; exit 1
+
+      echo "EXISTING_SESSION_UNHEALTHY_STOP_FIRST"
+      exit 1
+    fi
+
+    mkdir -m 700 "$STATE/.starting" 2>/dev/null || {
+      echo "CONCURRENT_START_OR_STALE_LOCK"
+      exit 1
+    }
+
+    trap 'rmdir "$STATE/.starting" 2>/dev/null || true' EXIT
+
+    reserve_display
+    reserve_ws
+
+    # Generate unique session password
+    "$PYTHON" -c '
+import secrets
+import string
+alphabet = string.ascii_letters + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(8)))
+' > "$STATE/password"
+
+    "$VNCPASSWD" -f < "$STATE/password" \
+      > "$STATE/vnc.passwd"
+
+    chmod 600 "$STATE/password" "$STATE/vnc.passwd"
+
+    "$TMUX" -L "$SOCKET" new-session \
+      -d -s "$SESSION" \
+      "/bin/bash \"$SELF\" worker >> \"$LOGS/worker.log\" 2>&1"
+
+    for i in $(seq 1 25); do
+      if ready; then
+        echo "DESKTOP_NETWORK_READY"
+        status
+        exit 0
       fi
+
+      if ! tmux_alive; then
+        echo "DESKTOP_WORKER_EXITED"
+        exit 1
+      fi
+
       sleep 1
     done
-    echo "Desktop has not reached network-ready state. Inspect $LOGS/worker.log"
+
+    echo "DESKTOP_START_TIMEOUT"
     exit 1
     ;;
-  status) show_status ;;
+
+  status)
+    status
+    ;;
+
+  connect)
+    ready || {
+      echo "DESKTOP_NOT_READY"
+      exit 1
+    }
+
+    [[ -r "$STATE/password" ]] || exit 1
+
+    read -r password < "$STATE/password"
+
+    [[ "$password" =~ ^[A-Za-z0-9]{8}$ ]] || exit 1
+
+    # Sensitive output: only for the authorized user.
+    printf 'CONNECT_V1 %s %s\n' "$WS_PORT" "$password"
+    ;;
+
   stop)
-    # Do not affect another user's tmux server or desktop processes.
-    stop_owned_pid "$ROOT/worker.pid" "$SELF"
+    stop_pid "$STATE/worker.pid" "$SELF"
+
     sleep 2
-    "$TMUX" -L "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
-    load_allocation || true
+
+    "$TMUX" -L "$SOCKET" kill-session \
+      -t "$SESSION" 2>/dev/null || true
+
+    load_display || true
     load_ws || true
-    [[ ! -f "$ROOT/websockify.pid" ]] || stop_owned_pid "$ROOT/websockify.pid" "${WS_PORT:-__unmatched__}"
-    [[ ! -f "$ROOT/gnome.pid" ]] || stop_owned_pid "$ROOT/gnome.pid" 'gnome-session'
-    [[ ! -f "$ROOT/xvnc.pid" ]] || stop_owned_pid "$ROOT/xvnc.pid" ":${DISPLAY_NO:-__unmatched__}"
+
+    stop_pid "$STATE/websockify.pid" \
+      "${WS_PORT:-__nomatch__}"
+
+    stop_pid "$STATE/gnome.pid" 'gnome-session'
+
+    stop_pid "$STATE/xvnc.pid" \
+      ":${DISPLAY_NO:-__nomatch__}"
+
     sleep 2
-    release_reservations
+
+    release
     ;;
+
   release)
-    if "$TMUX" -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
-      echo 'Desktop session is active; run stop first'; exit 1
-    fi
-    release_reservations
+    release
     ;;
-  *) echo 'Usage: desktopctl.v2 {start|status|stop|release}'; exit 2 ;;
+
+  *)
+    echo "Usage: desktopctl {start|status|connect|stop|release}"
+    exit 2
+    ;;
+
 esac
+EOF
+
+
+---------
+

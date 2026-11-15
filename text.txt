@@ -1,27 +1,127 @@
-cat > config.ru <<'EOF'
-require 'open3'
+cat > "$HOME/ood-desktop-poc/bin/desktopctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
 
-run lambda { |env|
-  stdout, stderr, status = Open3.capture3(
-    'ssh',
-    '-T',
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=yes',
-    '-o', 'ConnectTimeout=5',
-    '[USERNAME]@[DESKTOP_HOST]',
-    '/usr/bin/id', '-un'
-  )
+BASE="$HOME/ood-desktop-poc"
+STATE="$BASE/sessions/desktop30"
+LOGS="$BASE/logs"
+SCRIPT="$BASE/bin/desktopctl"
+SESSION="desktop30"
+SOCKET="ood_gnome_poc"
+DISPLAY_NO=30
+VNC_PORT=5930
 
-  result = if status.success?
-    "PASS: Remote SSH execution succeeded"
-  else
-    "FAIL: Remote SSH execution failed (exit #{status.exitstatus})"
-  end
+mkdir -p "$STATE" "$LOGS"
 
-  [
-    200,
-    { 'Content-Type' => 'text/html; charset=utf-8' },
-    ["<h2>Remote GNOME Launcher</h2><p>#{result}</p>"]
-  ]
+cleanup() {
+  trap - EXIT HUP INT TERM
+
+  if [[ -n "${GNOME_PID:-}" ]]; then
+    kill -TERM "$GNOME_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${VNC_PID:-}" ]]; then
+    kill -TERM "$VNC_PID" 2>/dev/null || true
+  fi
 }
+
+case "${1:-}" in
+
+  start)
+    if tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+      echo "Desktop session already running"
+      exit 0
+    fi
+
+    if [[ -e /tmp/.X11-unix/X30 ||
+          -e /tmp/.X30-lock ]] ||
+       ss -ltn | grep -q ':5930 '; then
+      echo "Display :30 or port 5930 is already occupied"
+      exit 1
+    fi
+
+    python3 -c '
+import secrets, string
+a = string.ascii_letters + string.digits
+print("".join(secrets.choice(a) for _ in range(8)))
+' > "$STATE/password"
+
+    vncpasswd -f < "$STATE/password" > "$STATE/vnc.passwd"
+
+    tmux -L "$SOCKET" new-session -d \
+      -s "$SESSION" \
+      "/bin/bash $SCRIPT run"
+
+    echo "Desktop startup submitted to tmux"
+    ;;
+
+  run)
+    trap cleanup EXIT HUP INT TERM
+
+    Xvnc :30 \
+      -geometry 1280x800 \
+      -depth 24 \
+      -localhost \
+      -SecurityTypes VncAuth \
+      -rfbauth "$STATE/vnc.passwd" \
+      -rfbport "$VNC_PORT" \
+      > "$LOGS/xvnc30.log" 2>&1 &
+
+    VNC_PID=$!
+    echo "$VNC_PID" > "$STATE/xvnc.pid"
+
+    sleep 3
+    kill -0 "$VNC_PID"
+
+    DISPLAY=:30 XDG_SESSION_TYPE=x11 \
+      dbus-run-session -- gnome-session \
+      > "$LOGS/gnome30.log" 2>&1 &
+
+    GNOME_PID=$!
+    echo "$GNOME_PID" > "$STATE/gnome.pid"
+
+    wait "$GNOME_PID"
+    ;;
+
+  status)
+    if tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+      echo "TMUX_SESSION_RUNNING"
+    else
+      echo "TMUX_SESSION_NOT_RUNNING"
+    fi
+
+    ss -ltn '( sport = :5930 )'
+    ;;
+
+  stop)
+    if tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+      tmux -L "$SOCKET" kill-session -t "$SESSION"
+    fi
+
+    # Allow the worker to process its cleanup trap.
+    sleep 1
+
+    for entry in "gnome:gnome.pid" "Xvnc:xvnc.pid"; do
+      name="${entry%%:*}"
+      file="${entry#*:}"
+
+      if [[ -f "$STATE/$file" ]]; then
+        pid=$(cat "$STATE/$file")
+        if [[ "$pid" =~ ^[0-9]+$ ]] &&
+           ps -p "$pid" -o args= 2>/dev/null | grep -q "$name"; then
+          kill -TERM "$pid" 2>/dev/null || true
+        fi
+      fi
+    done
+
+    echo "Stop requested for desktop :30"
+    ;;
+
+  *)
+    echo "Usage: $0 {start|status|stop}"
+    exit 1
+    ;;
+esac
 EOF
+
+chmod 700 "$HOME/ood-desktop-poc/bin/desktopctl"

@@ -1,292 +1,39 @@
 APP="/var/www/ood/apps/sys/remote_gnome_multi"
+cp -p "$APP/config.ru" "$APP/config.ru.before-csrf-fix"
 
-sudo mkdir -p "$APP"
+python3 - <<'PY'
+from pathlib import Path
 
-----
+p = Path("/var/www/ood/apps/sys/remote_gnome_multi/config.ru")
+s = p.read_text()
 
-sudo tee "$APP/manifest.yml" > /dev/null <<'EOF'
----
-name: Remote GNOME Desktops
-category: Interactive Apps
-subcategory: Desktops
-description: Launch and manage your own remote Linux desktop
-EOF
+old = "CSRF_TOKEN = SecureRandom.hex(32)"
 
-----
+new = """require 'fileutils'
 
-sudo tee "$APP/config.ru" > /dev/null <<'EOF'
-require 'cgi'
-require 'etc'
-require 'open3'
-require 'securerandom'
-require 'shellwords'
-require 'uri'
+csrf_dir = File.join(Dir.home, '.local', 'state', 'ood-gnome-web')
+FileUtils.mkdir_p(csrf_dir)
+File.chmod(0700, csrf_dir)
 
-# ==========================================
-# CONFIGURATION — REPLACE THESE VALUES
-# ==========================================
+csrf_file = File.join(csrf_dir, 'csrf_token')
 
-OOD_FQDN = '[OOD_FQDN]'
-DESKTOP_HOST = '[DESKTOP_HOST]'
+File.open(csrf_file + '.lock', File::RDWR | File::CREAT, 0600) do |lock|
+  lock.flock(File::LOCK_EX)
 
-DESKTOPCTL = '[ABSOLUTE_SHARED_DESKTOPCTL_PATH]'
-
-ALLOWED_USERS = [
-  '[USER_A]',
-  '[USER_B]',
-  '[USER_C]'
-].freeze
-
-ALLOWED_WS_PORTS = [6081, 6082, 6083].freeze
-
-# ==========================================
-# INTERNAL CONFIGURATION
-# ==========================================
-
-CSRF_TOKEN = SecureRandom.hex(32)
-
-ALLOWED_ACTIONS = %w[
-  start status connect stop
-].freeze
-
-def html_escape(value)
-  CGI.escapeHTML(value.to_s)
+  unless File.file?(csrf_file)
+    File.open(csrf_file, File::WRONLY | File::CREAT | File::EXCL, 0600) do |f|
+      f.write(SecureRandom.hex(32))
+    end
+  end
 end
 
-def response_page(body, status = 200)
-  [
-    status,
-    {
-      'Content-Type' => 'text/html; charset=utf-8',
-      'Cache-Control' => 'no-store, private',
-      'Referrer-Policy' => 'no-referrer',
-      'X-Content-Type-Options' => 'nosniff',
-      'X-Frame-Options' => 'SAMEORIGIN'
-    },
-    [body]
-  ]
-end
+CSRF_TOKEN = File.read(csrf_file).strip
+raise 'Invalid CSRF token' unless CSRF_TOKEN.match?(/\\\\A[0-9a-f]{64}\\\\z/)
+"""
 
-# ==========================================
-# SSH EXECUTION
-# ==========================================
+assert s.count(old) == 1, "Expected token definition not found"
+p.write_text(s.replace(old, new, 1))
+print("CSRF handling updated")
+PY
 
-def remote_desktop(user, action)
-  unless ALLOWED_ACTIONS.include?(action)
-    return [false, '', 'Action denied']
-  end
-
-  # Verify SSH has retained the expected user.
-  remote_command = %(
-    test "$(/usr/bin/id -un)" = #{Shellwords.escape(user)} &&
-    exec #{Shellwords.escape(DESKTOPCTL)} #{Shellwords.escape(action)}
-  ).strip.gsub(/\s+/, ' ')
-
-  stdout, stderr, status = Open3.capture3(
-    '/usr/bin/timeout', '45s',
-    '/usr/bin/ssh',
-    '-T',
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=yes',
-    '-o', 'ConnectTimeout=7',
-    '-o', 'ServerAliveInterval=10',
-    '-o', 'ServerAliveCountMax=2',
-    "#{user}@#{DESKTOP_HOST}",
-    remote_command
-  )
-
-  [status.success?, stdout, stderr]
-
-rescue StandardError => e
-  [false, '', "Remote execution error: #{e.class}"]
-end
-
-# ==========================================
-# WEB APPLICATION
-# ==========================================
-
-run lambda { |env|
-
-  # Determine identity from the Linux process,
-  # not from browser-supplied parameters.
-
-  user = Etc.getpwuid(Process.euid).name
-
-  allowed = Process.euid != 0 &&
-            ALLOWED_USERS.include?(user)
-
-  configured =
-    OOD_FQDN.match?(/\A[A-Za-z0-9.-]+\z/) &&
-    DESKTOP_HOST.match?(/\A[A-Za-z0-9.-]+\z/) &&
-    DESKTOPCTL.start_with?('/') &&
-    !DESKTOPCTL.include?('[')
-
-  unless allowed && configured
-    next response_page(
-      '<h2>Remote GNOME Desktops</h2><p>Access denied or application not configured.</p>',
-      403
-    )
-  end
-
-  message = ''
-
-  # ========================================
-  # LAUNCH / STOP REQUEST
-  # ========================================
-
-  if env['REQUEST_METHOD'] == 'POST'
-
-    origin = env['HTTP_ORIGIN']
-
-    if origin && origin != "https://#{OOD_FQDN}"
-      next response_page('<h2>Request rejected</h2>', 403)
-    end
-
-    content_type =
-      env['CONTENT_TYPE'].to_s.split(';', 2).first
-
-    unless content_type == 'application/x-www-form-urlencoded'
-      next response_page('<h2>Unsupported request</h2>', 415)
-    end
-
-    params = CGI.parse(env['rack.input'].read(2048))
-
-    action_values = params.fetch('action', [])
-    token_values = params.fetch('csrf', [])
-
-    unless action_values.length == 1 &&
-           token_values.length == 1 &&
-           token_values.first == CSRF_TOKEN &&
-           %w[start stop].include?(action_values.first)
-
-      next response_page('<h2>Request rejected</h2>', 403)
-    end
-
-    action = action_values.first
-
-    success, _, _ = remote_desktop(user, action)
-
-    message = if success
-      "#{action.capitalize} command succeeded."
-    else
-      "#{action.capitalize} command failed. Check private session logs."
-    end
-  end
-
-  # ========================================
-  # GET DESKTOP STATUS
-  # ========================================
-
-  status_ok, status_out, _ =
-    remote_desktop(user, 'status')
-
-  status_text = if status_ok
-    status_out
-  else
-    'Status unavailable. Verify SSH access for this user.'
-  end
-
-  ready = status_ok &&
-          status_out.lines.any? {
-            |line| line.strip == 'DESKTOP_NETWORK_READY'
-          }
-
-  # ========================================
-  # GENERATE USER CONNECTION LINK
-  # ========================================
-
-  connect_link = ''
-
-  if ready
-
-    conn_ok, conn_out, _ =
-      remote_desktop(user, 'connect')
-
-    match = conn_out.match(
-      /^CONNECT_V1\s+(\d{4,5})\s+([A-Za-z0-9]{8})\s*$/
-    )
-
-    if conn_ok && match &&
-       ALLOWED_WS_PORTS.include?(match[1].to_i)
-
-      ws_port = match[1]
-      password = match[2]
-
-      path = "rnode/#{DESKTOP_HOST}/#{ws_port}/websockify"
-
-      url =
-        "https://#{OOD_FQDN}/pun/sys/dashboard/noVNC-1.3.0/vnc.html" \
-        "?autoconnect=true" \
-        "&host=#{URI.encode_www_form_component(OOD_FQDN)}" \
-        "&port=443" \
-        "&encrypt=true" \
-        "&path=#{URI.encode_www_form_component(path)}" \
-        "#password=#{URI.encode_www_form_component(password)}"
-
-      connect_link = %(
-        <p>
-          <a href="#{html_escape(url)}"
-             target="_blank"
-             rel="noopener noreferrer">
-             Connect to Desktop
-          </a>
-        </p>
-      )
-    end
-  end
-
-  # ========================================
-  # HTML INTERFACE
-  # ========================================
-
-  html = <<~HTML
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <title>Remote GNOME Desktops</title>
-    </head>
-
-    <body>
-      <h2>Remote GNOME Desktops</h2>
-
-      <p>Linux account: #{html_escape(user)}</p>
-
-      <p>#{html_escape(message)}</p>
-
-      <form method="post">
-
-        <input
-          type="hidden"
-          name="csrf"
-          value="#{CSRF_TOKEN}">
-
-        <button type="submit"
-                name="action"
-                value="start">
-          Launch Desktop
-        </button>
-
-        <button type="submit"
-                name="action"
-                value="stop">
-          Stop Desktop
-        </button>
-
-      </form>
-
-      #{connect_link}
-
-      <h3>Session Status</h3>
-
-      <pre>#{html_escape(status_text)}</pre>
-
-      <p>Refresh this page to update status.</p>
-    </body>
-    </html>
-  HTML
-
-  response_page(html)
-}
-EOF
-
+ruby -c "$APP/config.ru"

@@ -1,100 +1,181 @@
-cat > config.ru <<'EOF'
-require 'open3'
-require 'cgi'
-require 'securerandom'
-require 'yaml'
+python3 - <<'PY'
+from pathlib import Path
+import shutil
+import ipaddress
 
-REMOTE = '[DESKTOP_USER]@[DESKTOP_HOST]'
-TOKEN = SecureRandom.hex(32)
+p = Path.home() / "ood-desktop-poc/bin/desktopctl"
+s = p.read_text()
 
-def desktop_command(action)
-  return [false, "Invalid action"] unless
-    %w[start status stop].include?(action)
+if "WEB_RUN=" in s:
+    raise SystemExit("Already patched. No changes made.")
 
-  out, err, status = Open3.capture3(
-    'ssh',
-    '-T',
-    '-o', 'BatchMode=yes',
-    '-o', 'StrictHostKeyChecking=yes',
-    '-o', 'ConnectTimeout=5',
-    REMOTE,
-    "\"$HOME/ood-desktop-poc/bin/desktopctl\" #{action}"
-  )
+web_run = input("Absolute path to websockify run: ").strip()
+web_bind = input("Approved desktop IPv4 address: ").strip()
 
-  [status.success?, status.success? ? out : err]
-rescue StandardError => e
-  [false, "#{e.class}: #{e.message}"]
-end
+if not Path(web_run).is_file() or '"' in web_run:
+    raise SystemExit("Invalid websockify launcher path.")
 
-run lambda { |env|
-  method = env['REQUEST_METHOD']
-  message = "Desktop status"
+ipaddress.IPv4Address(web_bind)
 
-  if method == 'POST'
-    params = CGI.parse(env['rack.input'].read(1024))
-    action = params.fetch('action', []).first
-    csrf = params.fetch('csrf', []).first
+def replace_once(old, new):
+    global s
+    if s.count(old) != 1:
+        raise SystemExit("Unexpected desktopctl version. No changes saved.")
+    s = s.replace(old, new, 1)
 
-    unless csrf == TOKEN && %w[start stop].include?(action)
-      next [
-        403,
-        {'Content-Type' => 'text/plain'},
-        ['Invalid request']
-      ]
+replace_once(
+    "VNC_PORT=5930\n",
+    f'''VNC_PORT=5930
+WEB_RUN="{web_run}"
+WEB_BIND="{web_bind}"
+WEB_PORT=6081
+'''
+)
+
+replace_once(
+    '  if [[ -n "${GNOME_PID:-}" ]]; then',
+    '''  if [[ -n "${WEB_PID:-}" ]]; then
+    kill -TERM "$WEB_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${GNOME_PID:-}" ]]; then'''
+)
+
+replace_once(
+    "    python3 -c '\nimport secrets, string",
+    '''    [[ -x "$WEB_RUN" ]] || {
+      echo "websockify launcher not executable"
+      exit 1
+    }
+
+    if ss -ltn "( sport = :$WEB_PORT )" |
+       grep -q '^LISTEN'; then
+      echo "WebSocket port already occupied"
+      exit 1
+    fi
+
+    python3 -c '
+import secrets, string'''
+)
+
+replace_once(
+    '''    echo "$GNOME_PID" > "$STATE/gnome.pid"
+
+    wait "$GNOME_PID"''',
+    '''    echo "$GNOME_PID" > "$STATE/gnome.pid"
+
+    "$WEB_RUN" "$WEB_BIND:$WEB_PORT" "127.0.0.1:$VNC_PORT" \\
+      > "$LOGS/websockify30.log" 2>&1 &
+
+    WEB_PID=$!
+    echo "$WEB_PID" > "$STATE/websockify.pid"
+
+    sleep 2
+    kill -0 "$WEB_PID" 2>/dev/null || {
+      echo "websockify startup failed" >&2
+      exit 1
+    }
+
+    wait "$GNOME_PID"'''
+)
+
+replace_once(
+    "    ss -ltn '( sport = :5930 )'",
+    '''    echo "=== Xvnc ==="
+    ss -ltn '( sport = :5930 )'
+    echo "=== websockify ==="
+    ss -ltn '( sport = :6081 )' '''
+)
+
+replace_once(
+    '''    for entry in "gnome:gnome.pid" "Xvnc:xvnc.pid"; do''',
+    '''    if [[ -f "$STATE/websockify.pid" ]]; then
+      pid=$(cat "$STATE/websockify.pid")
+      if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+        if [[ "$args" == *":6081"* &&
+              "$args" == *":5930"* ]]; then
+          kill -TERM "$pid" 2>/dev/null || true
+        fi
+      fi
+    fi
+
+    for entry in "gnome:gnome.pid" "Xvnc:xvnc.pid"; do'''
+)
+
+backup = p.with_name("desktopctl.before-websockify.bak")
+if backup.exists():
+    raise SystemExit("Backup already exists; no changes saved.")
+
+shutil.copy2(p, backup)
+p.write_text(s)
+print("Desktop launcher updated.")
+PY
+
+bash -n "$HOME/ood-desktop-poc/bin/desktopctl" \
+  && echo "Shell syntax OK"
+
+
+
+---------
+
+
+cd "$HOME/ondemand/dev/remote_gnome_launcher"
+
+python3 - <<'PY'
+from pathlib import Path
+import shutil
+
+p = Path("config.ru")
+s = p.read_text()
+
+needle = "  connect_link = if connect_url.empty?\n"
+
+if s.count(needle) != 1 or s.count("require 'yaml'\n") != 1:
+    raise SystemExit("Unexpected config.ru structure. No changes made.")
+
+s = s.replace(
+    "require 'yaml'\n",
+    "require 'yaml'\nrequire 'uri'\n",
+    1
+)
+
+addition = r'''  if ok && status_text.include?('TMUX_SESSION_RUNNING') &&
+     !connect_url.empty?
+
+    output, _, result = Open3.capture3(
+      'ssh', '-T',
+      '-o', 'BatchMode=yes',
+      '-o', 'StrictHostKeyChecking=yes',
+      '-o', 'ConnectTimeout=5',
+      REMOTE,
+      'cat "$HOME/ood-desktop-poc/sessions/desktop30/password"'
+    )
+
+    password = output.lines.map(&:strip).find do |line|
+      line.match?(/\A[A-Za-z0-9]{8}\z/)
     end
 
-    ok, result = desktop_command(action)
-    message = "#{action.upcase}: #{ok ? 'SUCCESS' : 'FAILED'}"
-  end
-
-  ok, status_text = desktop_command('status')
-
-  connect_url = begin
-    manifest = File.expand_path(
-      '../remote_gnome_poc/manifest.yml', __dir__
-    )
-    YAML.safe_load(File.read(manifest)).fetch('url')
-  rescue StandardError
-    ''
-  end
-
-  connect_link = if connect_url.empty?
-    'Connection shortcut unavailable'
+    if result.success? && password
+      connect_url = "#{connect_url.split('#').first}#password=#{URI.encode_www_form_component(password)}"
+    else
+      connect_url = ''
+    end
   else
-    "<a href=\"#{CGI.escapeHTML(connect_url)}\" " \
-    "target=\"_blank\" rel=\"noopener noreferrer\">" \
-    "Connect to Desktop</a>"
+    connect_url = ''
   end
 
-  html = <<~HTML
-    <h2>Remote GNOME Desktop Launcher</h2>
-    <p>#{CGI.escapeHTML(message)}</p>
+'''
 
-    <form method="post">
-      <input type="hidden" name="csrf" value="#{TOKEN}">
-      <button type="submit" name="action" value="start">
-        Launch Desktop
-      </button>
-      <button type="submit" name="action" value="stop">
-        Stop Desktop
-      </button>
-    </form>
+s = s.replace(needle, addition + needle, 1)
 
-    <p>#{connect_link}</p>
+backup = Path("config.ru.before-auto-password.bak")
+if backup.exists():
+    raise SystemExit("Backup already exists. No changes made.")
 
-    <h3>Session Status</h3>
-    <pre>#{CGI.escapeHTML(status_text)}</pre>
+shutil.copy2(p, backup)
+p.write_text(s)
 
-    <p>Refresh this page to update the status.</p>
-  HTML
+print("Automatic VNC password integration added.")
+PY
 
-  [
-    200,
-    {
-      'Content-Type' => 'text/html; charset=utf-8',
-      'Cache-Control' => 'no-store'
-    },
-    [html]
-  ]
-}
-EOF
+ruby -c config.ru

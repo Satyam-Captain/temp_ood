@@ -1,181 +1,118 @@
-python3 - <<'PY'
-from pathlib import Path
-import shutil
-import ipaddress
+BASE="[SHARED_APP_ROOT]/ood-gnome"
 
-p = Path.home() / "ood-desktop-poc/bin/desktopctl"
-s = p.read_text()
+cat > "$BASE/bin/desktopctl.v2" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
 
-if "WEB_RUN=" in s:
-    raise SystemExit("Already patched. No changes made.")
+STATE_DIR="$HOME/.local/state/ood-gnome-v2"
+STATE_FILE="$STATE_DIR/allocation"
+SS=/usr/sbin/ss
 
-web_run = input("Absolute path to websockify run: ").strip()
-web_bind = input("Approved desktop IPv4 address: ").strip()
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 
-if not Path(web_run).is_file() or '"' in web_run:
-    raise SystemExit("Invalid websockify launcher path.")
-
-ipaddress.IPv4Address(web_bind)
-
-def replace_once(old, new):
-    global s
-    if s.count(old) != 1:
-        raise SystemExit("Unexpected desktopctl version. No changes saved.")
-    s = s.replace(old, new, 1)
-
-replace_once(
-    "VNC_PORT=5930\n",
-    f'''VNC_PORT=5930
-WEB_RUN="{web_run}"
-WEB_BIND="{web_bind}"
-WEB_PORT=6081
-'''
-)
-
-replace_once(
-    '  if [[ -n "${GNOME_PID:-}" ]]; then',
-    '''  if [[ -n "${WEB_PID:-}" ]]; then
-    kill -TERM "$WEB_PID" 2>/dev/null || true
+show_status() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo "NO_ALLOCATION"
+    return
   fi
-  if [[ -n "${GNOME_PID:-}" ]]; then'''
-)
 
-replace_once(
-    "    python3 -c '\nimport secrets, string",
-    '''    [[ -x "$WEB_RUN" ]] || {
-      echo "websockify launcher not executable"
-      exit 1
-    }
+  read -r display port < "$STATE_FILE"
 
-    if ss -ltn "( sport = :$WEB_PORT )" |
-       grep -q '^LISTEN'; then
-      echo "WebSocket port already occupied"
+  echo "USER=$(id -un)"
+  echo "UID=$(id -u)"
+  echo "DISPLAY=:$display"
+  echo "VNC_PORT=$port"
+  echo "STATE=ALLOCATED_ONLY"
+}
+
+case "${1:-}" in
+
+  allocate)
+    if ! mkdir -m 700 "$STATE_DIR/.allocating" 2>/dev/null; then
+      echo "Another allocation is in progress or a stale lock exists"
       exit 1
     fi
 
-    python3 -c '
-import secrets, string'''
-)
+    trap 'rmdir "$STATE_DIR/.allocating" 2>/dev/null || true' EXIT
 
-replace_once(
-    '''    echo "$GNOME_PID" > "$STATE/gnome.pid"
+    if [[ -f "$STATE_FILE" ]]; then
+      show_status
+      exit 0
+    fi
 
-    wait "$GNOME_PID"''',
-    '''    echo "$GNOME_PID" > "$STATE/gnome.pid"
+    for display in $(seq 40 79); do
+      port=$((5900 + display))
+      lock="/tmp/ood-gnome-v2-display-$display"
 
-    "$WEB_RUN" "$WEB_BIND:$WEB_PORT" "127.0.0.1:$VNC_PORT" \\
-      > "$LOGS/websockify30.log" 2>&1 &
-
-    WEB_PID=$!
-    echo "$WEB_PID" > "$STATE/websockify.pid"
-
-    sleep 2
-    kill -0 "$WEB_PID" 2>/dev/null || {
-      echo "websockify startup failed" >&2
-      exit 1
-    }
-
-    wait "$GNOME_PID"'''
-)
-
-replace_once(
-    "    ss -ltn '( sport = :5930 )'",
-    '''    echo "=== Xvnc ==="
-    ss -ltn '( sport = :5930 )'
-    echo "=== websockify ==="
-    ss -ltn '( sport = :6081 )' '''
-)
-
-replace_once(
-    '''    for entry in "gnome:gnome.pid" "Xvnc:xvnc.pid"; do''',
-    '''    if [[ -f "$STATE/websockify.pid" ]]; then
-      pid=$(cat "$STATE/websockify.pid")
-      if [[ "$pid" =~ ^[0-9]+$ ]]; then
-        args=$(ps -p "$pid" -o args= 2>/dev/null || true)
-        if [[ "$args" == *":6081"* &&
-              "$args" == *":5930"* ]]; then
-          kill -TERM "$pid" 2>/dev/null || true
-        fi
+      # Atomic reservation across participating users
+      if ! mkdir -m 700 "$lock" 2>/dev/null; then
+        continue
       fi
+
+      # Check for an existing X11 display or TCP listener
+      if [[ -e "/tmp/.X${display}-lock" ||
+            -e "/tmp/.X11-unix/X${display}" ]] ||
+         "$SS" -H -ltn "( sport = :$port )" | grep -q .; then
+        rmdir "$lock"
+        continue
+      fi
+
+      printf '%s %s\n' "$display" "$port" > "$STATE_FILE"
+
+      echo "ALLOCATION_SUCCESS"
+      show_status
+      exit 0
+    done
+
+    echo "No display available in the test range"
+    exit 1
+    ;;
+
+  status)
+    show_status
+    ;;
+
+  release)
+    if [[ ! -f "$STATE_FILE" ]]; then
+      echo "NO_ALLOCATION"
+      exit 0
     fi
 
-    for entry in "gnome:gnome.pid" "Xvnc:xvnc.pid"; do'''
-)
+    read -r display port < "$STATE_FILE"
 
-backup = p.with_name("desktopctl.before-websockify.bak")
-if backup.exists():
-    raise SystemExit("Backup already exists; no changes saved.")
+    [[ "$display" =~ ^[0-9]+$ ]] || exit 1
 
-shutil.copy2(p, backup)
-p.write_text(s)
-print("Desktop launcher updated.")
-PY
+    lock="/tmp/ood-gnome-v2-display-$display"
 
-bash -n "$HOME/ood-desktop-poc/bin/desktopctl" \
-  && echo "Shell syntax OK"
+    # Never release a display while it is in use
+    if [[ -e "/tmp/.X${display}-lock" ||
+          -e "/tmp/.X11-unix/X${display}" ]] ||
+       "$SS" -H -ltn "( sport = :$port )" | grep -q .; then
+      echo "Display still in use; stop its server first"
+      exit 1
+    fi
 
-
-
----------
-
-
-cd "$HOME/ondemand/dev/remote_gnome_launcher"
-
-python3 - <<'PY'
-from pathlib import Path
-import shutil
-
-p = Path("config.ru")
-s = p.read_text()
-
-needle = "  connect_link = if connect_url.empty?\n"
-
-if s.count(needle) != 1 or s.count("require 'yaml'\n") != 1:
-    raise SystemExit("Unexpected config.ru structure. No changes made.")
-
-s = s.replace(
-    "require 'yaml'\n",
-    "require 'yaml'\nrequire 'uri'\n",
-    1
-)
-
-addition = r'''  if ok && status_text.include?('TMUX_SESSION_RUNNING') &&
-     !connect_url.empty?
-
-    output, _, result = Open3.capture3(
-      'ssh', '-T',
-      '-o', 'BatchMode=yes',
-      '-o', 'StrictHostKeyChecking=yes',
-      '-o', 'ConnectTimeout=5',
-      REMOTE,
-      'cat "$HOME/ood-desktop-poc/sessions/desktop30/password"'
-    )
-
-    password = output.lines.map(&:strip).find do |line|
-      line.match?(/\A[A-Za-z0-9]{8}\z/)
-    end
-
-    if result.success? && password
-      connect_url = "#{connect_url.split('#').first}#password=#{URI.encode_www_form_component(password)}"
+    if [[ -d "$lock" ]] &&
+       [[ "$(stat -c %u "$lock")" == "$(id -u)" ]]; then
+      rmdir "$lock"
+      rm -f "$STATE_FILE"
+      echo "ALLOCATION_RELEASED"
     else
-      connect_url = ''
-    end
-  else
-    connect_url = ''
-  end
+      echo "Reservation ownership mismatch"
+      exit 1
+    fi
+    ;;
 
-'''
+  *)
+    echo "Usage: desktopctl.v2 {allocate|status|release}"
+    exit 1
+    ;;
+esac
+EOF
 
-s = s.replace(needle, addition + needle, 1)
+chmod 755 "$BASE/bin/desktopctl.v2"
 
-backup = Path("config.ru.before-auto-password.bak")
-if backup.exists():
-    raise SystemExit("Backup already exists. No changes made.")
-
-shutil.copy2(p, backup)
-p.write_text(s)
-
-print("Automatic VNC password integration added.")
-PY
-
-ruby -c config.ru
+bash -n "$BASE/bin/desktopctl.v2" \
+  && echo "Syntax OK"

@@ -1,596 +1,292 @@
-BASE="[SHARED_APP_ROOT]/ood-gnome"
+APP="/var/www/ood/apps/sys/remote_gnome_multi"
 
-cat > "$BASE/bin/desktop.conf" <<'EOF'
-# Open OnDemand GNOME — Shared Configuration
+sudo mkdir -p "$APP"
 
-# Absolute path to the websockify run executable
-WEBSOCKIFY_RUN='[ABSOLUTE_PATH_TO_WEBSOCKIFY_RUN]'
+----
 
-# Approved desktop-host network interface
-WS_BIND_IP='[APPROVED_DESKTOP_IPV4]'
-
-# WebSocket ports reserved for the three-user POC
-WS_PORTS='6081 6082 6083'
+sudo tee "$APP/manifest.yml" > /dev/null <<'EOF'
+---
+name: Remote GNOME Desktops
+category: Interactive Apps
+subcategory: Desktops
+description: Launch and manage your own remote Linux desktop
 EOF
 
+----
+
+sudo tee "$APP/config.ru" > /dev/null <<'EOF'
+require 'cgi'
+require 'etc'
+require 'open3'
+require 'securerandom'
+require 'shellwords'
+require 'uri'
+
+# ==========================================
+# CONFIGURATION — REPLACE THESE VALUES
+# ==========================================
+
+OOD_FQDN = '[OOD_FQDN]'
+DESKTOP_HOST = '[DESKTOP_HOST]'
+
+DESKTOPCTL = '[ABSOLUTE_SHARED_DESKTOPCTL_PATH]'
+
+ALLOWED_USERS = [
+  '[USER_A]',
+  '[USER_B]',
+  '[USER_C]'
+].freeze
+
+ALLOWED_WS_PORTS = [6081, 6082, 6083].freeze
+
+# ==========================================
+# INTERNAL CONFIGURATION
+# ==========================================
+
+CSRF_TOKEN = SecureRandom.hex(32)
+
+ALLOWED_ACTIONS = %w[
+  start status connect stop
+].freeze
+
+def html_escape(value)
+  CGI.escapeHTML(value.to_s)
+end
+
+def response_page(body, status = 200)
+  [
+    status,
+    {
+      'Content-Type' => 'text/html; charset=utf-8',
+      'Cache-Control' => 'no-store, private',
+      'Referrer-Policy' => 'no-referrer',
+      'X-Content-Type-Options' => 'nosniff',
+      'X-Frame-Options' => 'SAMEORIGIN'
+    },
+    [body]
+  ]
+end
+
+# ==========================================
+# SSH EXECUTION
+# ==========================================
+
+def remote_desktop(user, action)
+  unless ALLOWED_ACTIONS.include?(action)
+    return [false, '', 'Action denied']
+  end
+
+  # Verify SSH has retained the expected user.
+  remote_command = %(
+    test "$(/usr/bin/id -un)" = #{Shellwords.escape(user)} &&
+    exec #{Shellwords.escape(DESKTOPCTL)} #{Shellwords.escape(action)}
+  ).strip.gsub(/\s+/, ' ')
+
+  stdout, stderr, status = Open3.capture3(
+    '/usr/bin/timeout', '45s',
+    '/usr/bin/ssh',
+    '-T',
+    '-o', 'BatchMode=yes',
+    '-o', 'StrictHostKeyChecking=yes',
+    '-o', 'ConnectTimeout=7',
+    '-o', 'ServerAliveInterval=10',
+    '-o', 'ServerAliveCountMax=2',
+    "#{user}@#{DESKTOP_HOST}",
+    remote_command
+  )
+
+  [status.success?, stdout, stderr]
+
+rescue StandardError => e
+  [false, '', "Remote execution error: #{e.class}"]
+end
+
+# ==========================================
+# WEB APPLICATION
+# ==========================================
+
+run lambda { |env|
+
+  # Determine identity from the Linux process,
+  # not from browser-supplied parameters.
+
+  user = Etc.getpwuid(Process.euid).name
+
+  allowed = Process.euid != 0 &&
+            ALLOWED_USERS.include?(user)
 
-------
+  configured =
+    OOD_FQDN.match?(/\A[A-Za-z0-9.-]+\z/) &&
+    DESKTOP_HOST.match?(/\A[A-Za-z0-9.-]+\z/) &&
+    DESKTOPCTL.start_with?('/') &&
+    !DESKTOPCTL.include?('[')
 
-BASE="[SHARED_APP_ROOT]/ood-gnome"
+  unless allowed && configured
+    next response_page(
+      '<h2>Remote GNOME Desktops</h2><p>Access denied or application not configured.</p>',
+      403
+    )
+  end
 
-cat > "$BASE/bin/desktopctl" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-umask 077
-
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+  message = ''
 
-# Shared administrator-maintained configuration
-SELF=$(readlink -f "$0")
-CONF="$(dirname "$SELF")/desktop.conf"
+  # ========================================
+  # LAUNCH / STOP REQUEST
+  # ========================================
 
-[[ -r "$CONF" ]] || {
-  echo "CONFIG_NOT_READABLE"
-  exit 1
-}
-
-source "$CONF"
-
-: "${WEBSOCKIFY_RUN:?}"
-: "${WS_BIND_IP:?}"
-: "${WS_PORTS:?}"
+  if env['REQUEST_METHOD'] == 'POST'
 
-[[ "$WEBSOCKIFY_RUN" != *'['* && "$WS_BIND_IP" != *'['* ]] || {
-  echo "CONFIG_NOT_SET"
-  exit 1
-}
+    origin = env['HTTP_ORIGIN']
 
-[[ $(id -u) -ne 0 ]] || {
-  echo "DO_NOT_RUN_AS_ROOT"
-  exit 1
-}
+    if origin && origin != "https://#{OOD_FQDN}"
+      next response_page('<h2>Request rejected</h2>', 403)
+    end
 
-# Executables
-XVNC=/usr/bin/Xvnc
-VNCPASSWD=/usr/bin/vncpasswd
-TMUX=/usr/bin/tmux
-DBUS=/usr/bin/dbus-run-session
-GNOME=/usr/bin/gnome-session
-SS=/usr/sbin/ss
-PYTHON=$(command -v python3)
+    content_type =
+      env['CONTENT_TYPE'].to_s.split(';', 2).first
 
-# Private user data
-STATE="$HOME/.local/state/ood-gnome-multi"
-LOGS="$STATE/logs"
+    unless content_type == 'application/x-www-form-urlencoded'
+      next response_page('<h2>Unsupported request</h2>', 415)
+    end
 
-ALLOC="$STATE/allocation"
-WSALLOC="$STATE/ws_port"
+    params = CGI.parse(env['rack.input'].read(2048))
 
-SOCKET="ood_gnome_multi"
-SESSION="desktop"
+    action_values = params.fetch('action', [])
+    token_values = params.fetch('csrf', [])
 
-DISPLAY_NO=""
-VNC_PORT=""
-WS_PORT=""
+    unless action_values.length == 1 &&
+           token_values.length == 1 &&
+           token_values.first == CSRF_TOKEN &&
+           %w[start stop].include?(action_values.first)
 
-XVNC_PID=""
-GNOME_PID=""
-WS_PID=""
+      next response_page('<h2>Request rejected</h2>', 403)
+    end
 
-mkdir -p -m 700 "$STATE" "$LOGS"
-chmod 700 "$STATE" "$LOGS"
+    action = action_values.first
 
-# ---------------------------------------
-# Common helpers
-# ---------------------------------------
+    success, _, _ = remote_desktop(user, action)
 
-listen_port() {
-  "$SS" -H -ltn "( sport = :$1 )" | grep -q .
-}
-
-display_lock() {
-  echo "/tmp/ood-gnome-multi-display-$1"
-}
-
-ws_lock() {
-  echo "/tmp/ood-gnome-multi-ws-$1"
-}
-
-release_lock() {
-  local path="$1"
-  local owner
-
-  [[ -d "$path" ]] || return 0
-
-  owner=$(stat -c '%u' "$path" 2>/dev/null || echo unknown)
-
-  if [[ "$owner" == "$(id -u)" ]]; then
-    rmdir "$path" 2>/dev/null || true
-  fi
-}
-
-check_tools() {
-  local executable
-
-  for executable in \
-    "$XVNC" "$VNCPASSWD" "$TMUX" \
-    "$DBUS" "$GNOME" "$SS" \
-    "$WEBSOCKIFY_RUN" "$PYTHON"
-  do
-    [[ -x "$executable" ]] || {
-      echo "MISSING_EXECUTABLE: $executable"
-      return 1
-    }
-  done
-
-  [[ "$WS_BIND_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-    echo "INVALID_BIND_IP"
-    return 1
-  }
-
-  [[ "$WS_PORTS" =~ ^[0-9]{4,5}(\ [0-9]{4,5})*$ ]] || {
-    echo "INVALID_WS_PORT_LIST"
-    return 1
-  }
-}
-
-load_display() {
-  [[ -r "$ALLOC" ]] || return 1
-
-  read -r DISPLAY_NO VNC_PORT < "$ALLOC"
-
-  [[ "$DISPLAY_NO" =~ ^[0-9]+$ &&
-     "$VNC_PORT" =~ ^[0-9]+$ ]] || return 1
-
-  (( DISPLAY_NO >= 40 &&
-     DISPLAY_NO <= 79 &&
-     VNC_PORT == DISPLAY_NO + 5900 ))
-}
-
-load_ws() {
-  [[ -r "$WSALLOC" ]] || return 1
-
-  read -r WS_PORT < "$WSALLOC"
-
-  [[ "$WS_PORT" =~ ^[0-9]+$ ]] || return 1
-
-  [[ " $WS_PORTS " == *" $WS_PORT "* ]]
-}
-
-tmux_alive() {
-  "$TMUX" -L "$SOCKET" has-session \
-    -t "$SESSION" 2>/dev/null
-}
-
-# ---------------------------------------
-# Allocate display and VNC port
-# ---------------------------------------
-
-reserve_display() {
-  local d port lock
-
-  if [[ -f "$ALLOC" ]]; then
-    load_display || return 1
-
-    [[ $(stat -c '%u' "$(display_lock "$DISPLAY_NO")" \
-      2>/dev/null || echo missing) == "$(id -u)" ]] || {
-      echo "DISPLAY_LOCK_NOT_OWNED"
-      return 1
-    }
-
-    return 0
-  fi
-
-  for d in $(seq 40 79); do
-    port=$((5900 + d))
-    lock=$(display_lock "$d")
-
-    # Preserve reservations belonging to the old v2 POC.
-    [[ ! -e "/tmp/ood-gnome-v2-display-$d" ]] || continue
-
-    mkdir -m 700 "$lock" 2>/dev/null || continue
-
-    if [[ -e "/tmp/.X${d}-lock" ||
-          -e "/tmp/.X11-unix/X${d}" ]] ||
-       listen_port "$port"; then
-
-      release_lock "$lock"
-      continue
-    fi
-
-    DISPLAY_NO="$d"
-    VNC_PORT="$port"
-
-    printf '%s %s\n' "$d" "$port" > "$ALLOC"
-
-    return 0
-  done
-
-  echo "NO_FREE_DISPLAY"
-  return 1
-}
-
-# ---------------------------------------
-# Allocate WebSocket port
-# ---------------------------------------
-
-reserve_ws() {
-  local port lock
-
-  if [[ -f "$WSALLOC" ]]; then
-    load_ws || return 1
-
-    [[ $(stat -c '%u' "$(ws_lock "$WS_PORT")" \
-      2>/dev/null || echo missing) == "$(id -u)" ]] || {
-      echo "WS_LOCK_NOT_OWNED"
-      return 1
-    }
-
-    return 0
-  fi
-
-  for port in $WS_PORTS; do
-    lock=$(ws_lock "$port")
-
-    # Avoid ports reserved by the earlier POC.
-    [[ ! -e "/tmp/ood-gnome-v2-websocket-$port" ]] || continue
-
-    mkdir -m 700 "$lock" 2>/dev/null || continue
-
-    if listen_port "$port"; then
-      release_lock "$lock"
-      continue
-    fi
-
-    WS_PORT="$port"
-    printf '%s\n' "$port" > "$WSALLOC"
-
-    return 0
-  done
-
-  echo "NO_FREE_WEBSOCKET_PORT"
-  return 1
-}
-
-# ---------------------------------------
-# Status and readiness
-# ---------------------------------------
-
-ready() {
-  load_display &&
-  load_ws &&
-  tmux_alive &&
-  listen_port "$VNC_PORT" &&
-  listen_port "$WS_PORT"
-}
-
-status() {
-  echo "USER=$(id -un)"
-  echo "UID=$(id -u)"
-
-  if tmux_alive; then
-    echo "TMUX_RUNNING"
-  else
-    echo "TMUX_NOT_RUNNING"
-  fi
-
-  if load_display; then
-    echo "DISPLAY=:$DISPLAY_NO"
-    echo "VNC_PORT=$VNC_PORT"
-
-    if listen_port "$VNC_PORT"; then
-      echo "XVNC_LISTENING"
+    message = if success
+      "#{action.capitalize} command succeeded."
     else
-      echo "XVNC_NOT_LISTENING"
-    fi
+      "#{action.capitalize} command failed. Check private session logs."
+    end
+  end
+
+  # ========================================
+  # GET DESKTOP STATUS
+  # ========================================
+
+  status_ok, status_out, _ =
+    remote_desktop(user, 'status')
+
+  status_text = if status_ok
+    status_out
   else
-    echo "NO_DISPLAY_ALLOCATION"
-  fi
+    'Status unavailable. Verify SSH access for this user.'
+  end
 
-  if load_ws; then
-    echo "WEBSOCKET_PORT=$WS_PORT"
+  ready = status_ok &&
+          status_out.lines.any? {
+            |line| line.strip == 'DESKTOP_NETWORK_READY'
+          }
 
-    if listen_port "$WS_PORT"; then
-      echo "WEBSOCKET_LISTENING"
-    else
-      echo "WEBSOCKET_NOT_LISTENING"
-    fi
-  else
-    echo "NO_WEBSOCKET_ALLOCATION"
-  fi
+  # ========================================
+  # GENERATE USER CONNECTION LINK
+  # ========================================
 
-  if ready; then
-    echo "DESKTOP_NETWORK_READY"
-  else
-    echo "DESKTOP_NOT_READY"
-  fi
+  connect_link = ''
+
+  if ready
+
+    conn_ok, conn_out, _ =
+      remote_desktop(user, 'connect')
+
+    match = conn_out.match(
+      /^CONNECT_V1\s+(\d{4,5})\s+([A-Za-z0-9]{8})\s*$/
+    )
+
+    if conn_ok && match &&
+       ALLOWED_WS_PORTS.include?(match[1].to_i)
+
+      ws_port = match[1]
+      password = match[2]
+
+      path = "rnode/#{DESKTOP_HOST}/#{ws_port}/websockify"
+
+      url =
+        "https://#{OOD_FQDN}/pun/sys/dashboard/noVNC-1.3.0/vnc.html" \
+        "?autoconnect=true" \
+        "&host=#{URI.encode_www_form_component(OOD_FQDN)}" \
+        "&port=443" \
+        "&encrypt=true" \
+        "&path=#{URI.encode_www_form_component(path)}" \
+        "#password=#{URI.encode_www_form_component(password)}"
+
+      connect_link = %(
+        <p>
+          <a href="#{html_escape(url)}"
+             target="_blank"
+             rel="noopener noreferrer">
+             Connect to Desktop
+          </a>
+        </p>
+      )
+    end
+  end
+
+  # ========================================
+  # HTML INTERFACE
+  # ========================================
+
+  html = <<~HTML
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Remote GNOME Desktops</title>
+    </head>
+
+    <body>
+      <h2>Remote GNOME Desktops</h2>
+
+      <p>Linux account: #{html_escape(user)}</p>
+
+      <p>#{html_escape(message)}</p>
+
+      <form method="post">
+
+        <input
+          type="hidden"
+          name="csrf"
+          value="#{CSRF_TOKEN}">
+
+        <button type="submit"
+                name="action"
+                value="start">
+          Launch Desktop
+        </button>
+
+        <button type="submit"
+                name="action"
+                value="stop">
+          Stop Desktop
+        </button>
+
+      </form>
+
+      #{connect_link}
+
+      <h3>Session Status</h3>
+
+      <pre>#{html_escape(status_text)}</pre>
+
+      <p>Refresh this page to update status.</p>
+    </body>
+    </html>
+  HTML
+
+  response_page(html)
 }
-
-# ---------------------------------------
-# Desktop worker
-# ---------------------------------------
-
-worker_cleanup() {
-  trap - EXIT HUP INT TERM
-
-  [[ -z "$WS_PID" ]] ||
-    kill -TERM "$WS_PID" 2>/dev/null || true
-
-  [[ -z "$GNOME_PID" ]] ||
-    kill -TERM "$GNOME_PID" 2>/dev/null || true
-
-  [[ -z "$XVNC_PID" ]] ||
-    kill -TERM "$XVNC_PID" 2>/dev/null || true
-
-  rm -f "$STATE/worker.pid"
-}
-
-worker() {
-  check_tools
-
-  load_display && load_ws || {
-    echo "ALLOCATION_MISSING"
-    return 1
-  }
-
-  trap worker_cleanup EXIT
-  trap 'exit 143' HUP INT TERM
-
-  echo "$$" > "$STATE/worker.pid"
-
-  # Start Xvnc
-  "$XVNC" ":$DISPLAY_NO" \
-    -geometry 1280x800 \
-    -depth 24 \
-    -localhost \
-    -SecurityTypes VncAuth \
-    -rfbauth "$STATE/vnc.passwd" \
-    -rfbport "$VNC_PORT" \
-    > "$LOGS/xvnc.log" 2>&1 &
-
-  XVNC_PID=$!
-  echo "$XVNC_PID" > "$STATE/xvnc.pid"
-
-  sleep 2
-
-  kill -0 "$XVNC_PID" 2>/dev/null || {
-    echo "XVNC_START_FAILED"
-    return 1
-  }
-
-  # Start GNOME
-  DISPLAY=":$DISPLAY_NO" \
-  XDG_SESSION_TYPE=x11 \
-    "$DBUS" -- "$GNOME" \
-    > "$LOGS/gnome.log" 2>&1 &
-
-  GNOME_PID=$!
-  echo "$GNOME_PID" > "$STATE/gnome.pid"
-
-  # Start websockify
-  "$WEBSOCKIFY_RUN" \
-    "$WS_BIND_IP:$WS_PORT" \
-    "127.0.0.1:$VNC_PORT" \
-    > "$LOGS/websockify.log" 2>&1 &
-
-  WS_PID=$!
-  echo "$WS_PID" > "$STATE/websockify.pid"
-
-  sleep 2
-
-  kill -0 "$WS_PID" 2>/dev/null || {
-    echo "WEBSOCKIFY_START_FAILED"
-    return 1
-  }
-
-  # Keep the session alive while the components run.
-  while kill -0 "$XVNC_PID" 2>/dev/null &&
-        kill -0 "$GNOME_PID" 2>/dev/null &&
-        kill -0 "$WS_PID" 2>/dev/null
-  do
-    sleep 3
-  done
-
-  echo "DESKTOP_COMPONENT_EXITED"
-}
-
-# ---------------------------------------
-# Process termination helper
-# ---------------------------------------
-
-stop_pid() {
-  local file="$1"
-  local expected="$2"
-  local pid uid args
-
-  [[ -r "$file" ]] || return 0
-
-  read -r pid < "$file" || return 0
-
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-
-  uid=$(ps -p "$pid" -o uid= 2>/dev/null | tr -d ' ' || true)
-  args=$(ps -p "$pid" -o args= 2>/dev/null || true)
-
-  if [[ "$uid" == "$(id -u)" &&
-        "$args" == *"$expected"* ]]; then
-
-    kill -TERM "$pid" 2>/dev/null || true
-  fi
-}
-
-# ---------------------------------------
-# Release reserved resources
-# ---------------------------------------
-
-release() {
-  if tmux_alive; then
-    echo "SESSION_ACTIVE_STOP_FIRST"
-    return 1
-  fi
-
-  if load_display; then
-    if listen_port "$VNC_PORT" ||
-       [[ -e "/tmp/.X${DISPLAY_NO}-lock" ||
-          -e "/tmp/.X11-unix/X${DISPLAY_NO}" ]]; then
-
-      echo "DISPLAY_STILL_BUSY"
-      return 1
-    fi
-  fi
-
-  if load_ws && listen_port "$WS_PORT"; then
-    echo "WEBSOCKET_STILL_BUSY"
-    return 1
-  fi
-
-  if load_display; then
-    release_lock "$(display_lock "$DISPLAY_NO")"
-    rm -f "$ALLOC"
-  fi
-
-  if load_ws; then
-    release_lock "$(ws_lock "$WS_PORT")"
-    rm -f "$WSALLOC"
-  fi
-
-  rm -f \
-    "$STATE/worker.pid" \
-    "$STATE/xvnc.pid" \
-    "$STATE/gnome.pid" \
-    "$STATE/websockify.pid" \
-    "$STATE/password" \
-    "$STATE/vnc.passwd"
-
-  echo "RESERVATIONS_RELEASED"
-}
-
-# ---------------------------------------
-# Main command dispatcher
-# ---------------------------------------
-
-case "${1:-}" in
-
-  worker)
-    worker
-    ;;
-
-  start)
-    check_tools
-
-    if tmux_alive; then
-      if ready; then
-        echo "DESKTOP_ALREADY_RUNNING"
-        status
-        exit 0
-      fi
-
-      echo "EXISTING_SESSION_UNHEALTHY_STOP_FIRST"
-      exit 1
-    fi
-
-    mkdir -m 700 "$STATE/.starting" 2>/dev/null || {
-      echo "CONCURRENT_START_OR_STALE_LOCK"
-      exit 1
-    }
-
-    trap 'rmdir "$STATE/.starting" 2>/dev/null || true' EXIT
-
-    reserve_display
-    reserve_ws
-
-    # Generate unique session password
-    "$PYTHON" -c '
-import secrets
-import string
-alphabet = string.ascii_letters + string.digits
-print("".join(secrets.choice(alphabet) for _ in range(8)))
-' > "$STATE/password"
-
-    "$VNCPASSWD" -f < "$STATE/password" \
-      > "$STATE/vnc.passwd"
-
-    chmod 600 "$STATE/password" "$STATE/vnc.passwd"
-
-    "$TMUX" -L "$SOCKET" new-session \
-      -d -s "$SESSION" \
-      "/bin/bash \"$SELF\" worker >> \"$LOGS/worker.log\" 2>&1"
-
-    for i in $(seq 1 25); do
-      if ready; then
-        echo "DESKTOP_NETWORK_READY"
-        status
-        exit 0
-      fi
-
-      if ! tmux_alive; then
-        echo "DESKTOP_WORKER_EXITED"
-        exit 1
-      fi
-
-      sleep 1
-    done
-
-    echo "DESKTOP_START_TIMEOUT"
-    exit 1
-    ;;
-
-  status)
-    status
-    ;;
-
-  connect)
-    ready || {
-      echo "DESKTOP_NOT_READY"
-      exit 1
-    }
-
-    [[ -r "$STATE/password" ]] || exit 1
-
-    read -r password < "$STATE/password"
-
-    [[ "$password" =~ ^[A-Za-z0-9]{8}$ ]] || exit 1
-
-    # Sensitive output: only for the authorized user.
-    printf 'CONNECT_V1 %s %s\n' "$WS_PORT" "$password"
-    ;;
-
-  stop)
-    stop_pid "$STATE/worker.pid" "$SELF"
-
-    sleep 2
-
-    "$TMUX" -L "$SOCKET" kill-session \
-      -t "$SESSION" 2>/dev/null || true
-
-    load_display || true
-    load_ws || true
-
-    stop_pid "$STATE/websockify.pid" \
-      "${WS_PORT:-__nomatch__}"
-
-    stop_pid "$STATE/gnome.pid" 'gnome-session'
-
-    stop_pid "$STATE/xvnc.pid" \
-      ":${DISPLAY_NO:-__nomatch__}"
-
-    sleep 2
-
-    release
-    ;;
-
-  release)
-    release
-    ;;
-
-  *)
-    echo "Usage: desktopctl {start|status|connect|stop|release}"
-    exit 2
-    ;;
-
-esac
 EOF
-
-
----------
 

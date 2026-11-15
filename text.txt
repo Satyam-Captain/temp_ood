@@ -1,127 +1,100 @@
-cat > "$HOME/ood-desktop-poc/bin/desktopctl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-umask 077
+cat > config.ru <<'EOF'
+require 'open3'
+require 'cgi'
+require 'securerandom'
+require 'yaml'
 
-BASE="$HOME/ood-desktop-poc"
-STATE="$BASE/sessions/desktop30"
-LOGS="$BASE/logs"
-SCRIPT="$BASE/bin/desktopctl"
-SESSION="desktop30"
-SOCKET="ood_gnome_poc"
-DISPLAY_NO=30
-VNC_PORT=5930
+REMOTE = '[DESKTOP_USER]@[DESKTOP_HOST]'
+TOKEN = SecureRandom.hex(32)
 
-mkdir -p "$STATE" "$LOGS"
+def desktop_command(action)
+  return [false, "Invalid action"] unless
+    %w[start status stop].include?(action)
 
-cleanup() {
-  trap - EXIT HUP INT TERM
+  out, err, status = Open3.capture3(
+    'ssh',
+    '-T',
+    '-o', 'BatchMode=yes',
+    '-o', 'StrictHostKeyChecking=yes',
+    '-o', 'ConnectTimeout=5',
+    REMOTE,
+    "\"$HOME/ood-desktop-poc/bin/desktopctl\" #{action}"
+  )
 
-  if [[ -n "${GNOME_PID:-}" ]]; then
-    kill -TERM "$GNOME_PID" 2>/dev/null || true
-  fi
-  if [[ -n "${VNC_PID:-}" ]]; then
-    kill -TERM "$VNC_PID" 2>/dev/null || true
-  fi
+  [status.success?, status.success? ? out : err]
+rescue StandardError => e
+  [false, "#{e.class}: #{e.message}"]
+end
+
+run lambda { |env|
+  method = env['REQUEST_METHOD']
+  message = "Desktop status"
+
+  if method == 'POST'
+    params = CGI.parse(env['rack.input'].read(1024))
+    action = params.fetch('action', []).first
+    csrf = params.fetch('csrf', []).first
+
+    unless csrf == TOKEN && %w[start stop].include?(action)
+      next [
+        403,
+        {'Content-Type' => 'text/plain'},
+        ['Invalid request']
+      ]
+    end
+
+    ok, result = desktop_command(action)
+    message = "#{action.upcase}: #{ok ? 'SUCCESS' : 'FAILED'}"
+  end
+
+  ok, status_text = desktop_command('status')
+
+  connect_url = begin
+    manifest = File.expand_path(
+      '../remote_gnome_poc/manifest.yml', __dir__
+    )
+    YAML.safe_load(File.read(manifest)).fetch('url')
+  rescue StandardError
+    ''
+  end
+
+  connect_link = if connect_url.empty?
+    'Connection shortcut unavailable'
+  else
+    "<a href=\"#{CGI.escapeHTML(connect_url)}\" " \
+    "target=\"_blank\" rel=\"noopener noreferrer\">" \
+    "Connect to Desktop</a>"
+  end
+
+  html = <<~HTML
+    <h2>Remote GNOME Desktop Launcher</h2>
+    <p>#{CGI.escapeHTML(message)}</p>
+
+    <form method="post">
+      <input type="hidden" name="csrf" value="#{TOKEN}">
+      <button type="submit" name="action" value="start">
+        Launch Desktop
+      </button>
+      <button type="submit" name="action" value="stop">
+        Stop Desktop
+      </button>
+    </form>
+
+    <p>#{connect_link}</p>
+
+    <h3>Session Status</h3>
+    <pre>#{CGI.escapeHTML(status_text)}</pre>
+
+    <p>Refresh this page to update the status.</p>
+  HTML
+
+  [
+    200,
+    {
+      'Content-Type' => 'text/html; charset=utf-8',
+      'Cache-Control' => 'no-store'
+    },
+    [html]
+  ]
 }
-
-case "${1:-}" in
-
-  start)
-    if tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
-      echo "Desktop session already running"
-      exit 0
-    fi
-
-    if [[ -e /tmp/.X11-unix/X30 ||
-          -e /tmp/.X30-lock ]] ||
-       ss -ltn | grep -q ':5930 '; then
-      echo "Display :30 or port 5930 is already occupied"
-      exit 1
-    fi
-
-    python3 -c '
-import secrets, string
-a = string.ascii_letters + string.digits
-print("".join(secrets.choice(a) for _ in range(8)))
-' > "$STATE/password"
-
-    vncpasswd -f < "$STATE/password" > "$STATE/vnc.passwd"
-
-    tmux -L "$SOCKET" new-session -d \
-      -s "$SESSION" \
-      "/bin/bash $SCRIPT run"
-
-    echo "Desktop startup submitted to tmux"
-    ;;
-
-  run)
-    trap cleanup EXIT HUP INT TERM
-
-    Xvnc :30 \
-      -geometry 1280x800 \
-      -depth 24 \
-      -localhost \
-      -SecurityTypes VncAuth \
-      -rfbauth "$STATE/vnc.passwd" \
-      -rfbport "$VNC_PORT" \
-      > "$LOGS/xvnc30.log" 2>&1 &
-
-    VNC_PID=$!
-    echo "$VNC_PID" > "$STATE/xvnc.pid"
-
-    sleep 3
-    kill -0 "$VNC_PID"
-
-    DISPLAY=:30 XDG_SESSION_TYPE=x11 \
-      dbus-run-session -- gnome-session \
-      > "$LOGS/gnome30.log" 2>&1 &
-
-    GNOME_PID=$!
-    echo "$GNOME_PID" > "$STATE/gnome.pid"
-
-    wait "$GNOME_PID"
-    ;;
-
-  status)
-    if tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
-      echo "TMUX_SESSION_RUNNING"
-    else
-      echo "TMUX_SESSION_NOT_RUNNING"
-    fi
-
-    ss -ltn '( sport = :5930 )'
-    ;;
-
-  stop)
-    if tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
-      tmux -L "$SOCKET" kill-session -t "$SESSION"
-    fi
-
-    # Allow the worker to process its cleanup trap.
-    sleep 1
-
-    for entry in "gnome:gnome.pid" "Xvnc:xvnc.pid"; do
-      name="${entry%%:*}"
-      file="${entry#*:}"
-
-      if [[ -f "$STATE/$file" ]]; then
-        pid=$(cat "$STATE/$file")
-        if [[ "$pid" =~ ^[0-9]+$ ]] &&
-           ps -p "$pid" -o args= 2>/dev/null | grep -q "$name"; then
-          kill -TERM "$pid" 2>/dev/null || true
-        fi
-      fi
-    done
-
-    echo "Stop requested for desktop :30"
-    ;;
-
-  *)
-    echo "Usage: $0 {start|status|stop}"
-    exit 1
-    ;;
-esac
 EOF
-
-chmod 700 "$HOME/ood-desktop-poc/bin/desktopctl"

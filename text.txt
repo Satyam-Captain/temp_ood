@@ -1,21 +1,648 @@
-APP="/var/www/ood/apps/sys/remote_gnome_multi"
+TECHNICAL IMPLEMENTATION & SECURITY REFERENCE
+Open OnDemand
+Remote GNOME Desktop
+VNC / noVNC / websockify implementation, multi-user architecture, operational lessons, cybersecurity review, and Amazon DCV evaluation
+DOCUMENT SCOPE
+Office host-to-host implementation. All hostnames, account names, addresses, internal paths and project identifiers are represented by placeholders. This document contains no passwords or internal network values.
 
-sudo cp -p "$APP/config.ru" "$APP/config.ru.before-regex-fix"
+Document control	Value
+Version	1.0 — engineering reference
+Issued	18 November 2026
+Implementation	Working single-user and initial multi-user OOD remote GNOME pilot
+Production status	Not production-authorized; security, lifecycle and multi-user acceptance conditions remain
+Intended readers	Scientific computing platform engineers, HPC/OOD integrators, Linux administrators, network and cybersecurity reviewers
+Source classification: implementation history supplied in the project conversation, with external product assertions separately referenced to vendor documentation. This document is not an as-built export of live infrastructure.
 
-sudo python3 - <<'PY'
-from pathlib import Path
+ Contents
+1.  Executive summary and status
+2.  Scope, objectives and environment
+3.  Foundational concepts and component responsibilities
+4.  End-to-end VNC architecture
+5.  How the implementation was achieved
+6.  Application and configuration reference
+7.  Network ports and connectivity matrix
+8.  Session lifecycle, identity and multi-user isolation
+9.  Logs, quotas, process cleanup and NFS behavior
+10.  Troubleshooting knowledge base
+11.  Cybersecurity assessment and decisions
+12.  Amazon DCV: product architecture and features
+13.  DCV ports, dependencies and integration patterns
+14.  VNC versus DCV: engineering comparison
+15.  Decision gates and next-phase plan
+16.  Operational command reference
+17.  Glossary
+18.  Official sources and verification notes
+READING GUIDE
+Sections 1–11 document the working VNC design and observed incidents. Sections 12–15 describe DCV as a proposed evaluation, not a deployed component. Sections 16–18 are a quick-use appendix and source register.
 
-p = Path("/var/www/ood/apps/sys/remote_gnome_multi/config.ru")
-s = p.read_text()
 
-wrong = r"/\\A[0-9a-f]{64}\\z/"
-correct = r"/\A[0-9a-f]{64}\z/"
+ 1. Executive summary and status
+A scheduler-free remote graphical desktop capability was implemented from a browser-accessible Open OnDemand (OOD) portal to a separate Linux desktop execution host. The working chain uses the OOD Dashboard and a Ruby Rack/Passenger application, non-interactive SSH, a detached tmux session, an Xvnc server, GNOME, websockify, the OOD Apache reverse proxy, and a noVNC browser client. No batch scheduler is in the execution path.
+The initial implementation used a fixed desktop display and ports; it was then extended to a shared, user-executed launcher that allocates distinct display/VNC/WebSocket resources and keeps private session material in each user’s home directory. Two Linux identities were observed with separate allocations, and the multi-user OOD system application was successfully used to start a remote desktop for the primary test account.
+STATUS QUALIFICATION
+Working: OOD launch path for the primary user, browser connection, automatic connection credential handling in the pilot, per-user Linux allocation, and manually demonstrated network flow. Not fully signed off: three simultaneous OOD logins, isolation against forged cross-user proxy URLs, complete descendant-process cleanup, production credential handling, approved network boundaries, long-running log retention and availability.
 
-if s.count(wrong) != 1:
-    raise SystemExit("Expected escaping error not found; file unchanged.")
+1.1 Delivered capability
+•	System-wide OOD application shows Launch Desktop, Connect to Desktop and Stop Desktop actions.
+•	Per-user Passenger backend executes the approved remote launcher through non-interactive SSH under the invoking Linux identity.
+•	Shared desktopctl code selects an available X11 display and ports, generates private credentials, and launches Xvnc/GNOME/websockify through tmux.
+•	Browser loads noVNC from the OOD Dashboard and reaches the websockify endpoint through Apache /rnode.
+•	VNC connection runs without exposing the raw VNC listener on a non-loopback address.
+•	Individual session state and debug logs reside in each user’s home directory; they are not stored with the shared executable.
+1.2 Explicit remaining risks
+•	Legacy VNC authentication is not suitable as a stand-alone enterprise authentication boundary; reverse-proxy authorization must be assessed.
+•	WebSocket back-end traffic was tested without a separate TLS layer; proxy-network trust and encryption requirements need security approval.
+•	An OOD Stop action may leave GNOME/D-Bus descendants running; orphan processes retained an NFS temporary file and exhausted a quota.
+•	Fixed or shared IP binding configuration can fail with Errno 99 if the address is not assigned to the execution host.
+•	Current code and paths are a pilot; security/identity hardening and concurrent-user acceptance must precede broad rollout.
+2. Scope, objectives and environment
+2.1 Primary objective
+Provide a browser-based remote Linux desktop through OOD without LSF/Slurm or container-based execution. Keep desktop execution on [DESKTOP_HOST], preserve individual Linux identities and make resource allocation and connection management possible from a shared OOD application.
+2.2 Host roles
+Role	Placeholder	Responsibilities
+Portal host	[OOD_HOST]	OOD Apache front end, authentication, PUN, Passenger, app discovery and /rnode proxy.
+Desktop host	[DESKTOP_HOST]	Non-interactive SSH target; GNOME, Xvnc, websockify and tmux run here.
+Shared application filer	[SHARED_APP_ROOT]	Holds administrator-maintained launcher scripts/configuration accessible to execution hosts.
+User home	[USER_HOME]	Private VNC session state, passwords, logs, process identifiers and quota.
+Browser endpoint	[OOD_FQDN]	HTTPS portal front door; noVNC HTML/JavaScript client is served here.
+2.3 Observed software and variants
+Component	Observed / notes
+OOD	4.2.x family on office portal; earlier source paths showed 4.2.3 package tree.
+Execution OS	Linux/RHEL family; actual target host observed with legacy GNOME components. Verify OS release for each host.
+Xvnc / TigerVNC	TigerVNC Xvnc 1.8.x observed in command output; legacy software baseline requiring review.
+websockify	0.11.0 source-tree launcher invoked through an absolute /run path; Python interpreter path differed from interactive shell.
+tmux	tmux 1.8; remote detached-process persistence confirmed.
+Desktop	GNOME session (and D-Bus user services) under each Linux user.
+Web client	Bundled OOD noVNC path using noVNC-1.3.0 in observed URL.
+Recorded versions are from implementation observations and may not be identical across future hosts. Inventory must be refreshed before a security review or migration.
+Supportability note: current OOD 4.2 interactive-app documentation lists TurboVNC 2.1+ and websockify 0.13.0+ as its software baseline for standard VNC Batch Connect deployments. The observed TigerVNC 1.8 and websockify 0.11 custom implementation is therefore not equivalent to a fully vendor-supported stock desktop configuration. This requires a security and compatibility upgrade review. [S16]
+2.4 What is deliberately outside this VNC implementation
+No LSF or Slurm queue submission, no scheduler accounting, no enterprise multi-host desktop placement, no high-availability broker, no completed DCV deployment, and no claim that a user-level systemd manager is available on the desktop host.
+3. Foundational concepts and component responsibilities
+Component	What it solves	Who uses it
+Apache	Public HTTPS/authentication and reverse proxy routing	Browser; OOD portal front end
+Per-user NGINX (PUN)	Serves per-user OOD routes via local Unix sockets	Apache; Dashboard; application routes
+Passenger	Runs and manages the Ruby Rack app process	PUN routes app request to config.ru
+Rack / config.ru	Maps incoming HTTP requests to a response or a controlled action	Custom Launch/Stop/Connect UI
+SSH -T	Executes an authorized command without allocating a pseudo-terminal	Passenger backend to desktop host
+tmux	Keeps remote worker process alive after SSH exits	desktopctl process manager
+Xvnc / TigerVNC	Creates virtual X11 display and RFB protocol endpoint	GNOME renders into display; viewer reads framebuffer
+GNOME	Desktop shell, windows, settings and user applications	Remote user desktop
+websockify	Bridges browser WebSocket frames to a raw TCP VNC stream	noVNC browser client; Xvnc backend
+noVNC	HTML5 browser client that speaks VNC/RFB over WebSockets	End user in Chrome/Edge/Firefox
+OOD /rnode	Relative-path reverse proxy to a configured host and port	Apache forwards WebSocket traffic to websockify
+3.1 Xvnc versus GNOME versus noVNC
+Xvnc is both a virtual X server and a VNC server. It owns the virtual display, such as :40, and listens for RFB connections, typically TCP 5900 plus the display number. GNOME is the desktop environment that runs inside the X display. noVNC is only the browser viewer; it cannot create an X display or launch GNOME. websockify translates the browser-facing WebSocket transport into the TCP byte stream expected by Xvnc.
+3.2 What Passenger does not do
+Passenger runs the Ruby web backend and handles requests; it is not itself a remote desktop session manager. The custom app invokes desktopctl through an approved SSH connection. Desktop lifecycle and authorization must be implemented by the application and launcher. This separation explains why an OOD app could render successfully while remote startup still failed.
+3.3 How authentication layers differ
+OOD login authenticates the browser to the portal. SSH authenticates the per-user backend to the remote Linux host. VNC authentication independently protects the RFB connection. These are separate checks; success in one layer does not imply authorization in another. The pilot’s automatic password handoff reduces user prompts but does not replace an ownership check at the proxy boundary.
+4. End-to-end VNC architecture
+4.1 Working request/data-flow architecture
+Browser → HTTPS :443 → [OOD_FQDN] / OOD Apache
+↓ Authenticated /pun/sys/... request → per-user NGINX → Passenger
+↓ Ruby backend: POST Launch / Status / Stop → SSH TCP :22
+↓ [DESKTOP_HOST]: desktopctl → tmux worker
+↓ Xvnc display :40 (loopback TCP :5940) + GNOME
+↓ websockify bind [DESKTOP_PRIVATE_IP]:6081 → 127.0.0.1:5940
+↑ Browser: noVNC wss://[OOD_FQDN]:443/rnode/[DESKTOP_HOST]/6081/websockify
 
-p.write_text(s.replace(wrong, correct, 1))
-print("CSRF regex corrected")
-PY
+This is the current pilot flow, not a recommendation to expose every websockify port on an unrestricted corporate network. Apache terminates browser HTTPS/WSS and forwards to a backend endpoint; whether the backend leg is encrypted depends on the proxy and websockify configuration. The observed backend leg used raw HTTP/WebSocket.
+4.2 Startup sequence
+1.	User authenticates to the OOD portal and selects the shared desktop application.
+2.	Apache forwards the per-user app route to the matching NGINX PUN and Passenger Rack app.
+3.	config.ru identifies the current effective Linux UID, checks the application allowlist, validates POST action/CSRF/origin and constructs a fixed remote launcher invocation.
+4.	SSH runs without a pseudo-terminal and checks the expected remote Linux username before executing desktopctl.
+5.	desktopctl acquires a startup lock, allocates display/VNC/WebSocket resources, writes private VNC credentials and starts the detached tmux worker.
+6.	The worker starts Xvnc, GNOME (through a D-Bus session), and websockify; status reports network readiness after listeners are reachable.
+7.	The backend obtains only the owning user’s allocated WebSocket port and current VNC credential, then produces a noVNC link.
+8.	Browser opens noVNC; Apache /rnode proxies WebSocket traffic to the allocated backend; websockify forwards to loopback Xvnc.
+4.3 Stop sequence and its current limitation
+The Stop action runs desktopctl stop, which signals tracked process IDs and kills the specific tmux session, then tries to release reservations. This handles the main worker, Xvnc, GNOME parent and websockify, but testing proved that child processes spawned by GNOME/D-Bus can survive their parent and retain open NFS files. Production completion requires session-scoped descendant cleanup without stopping another user’s processes.
+4.4 Why /rnode instead of /node
+OOD documents /node as preserving the prefix in the backend request path, while /rnode strips the dynamic prefix and forwards only the relative backend path. The pilot used /rnode because the simple websockify endpoint expected /websockify, not an OOD-specific dynamic prefix. Apache must explicitly enable the proxy and constrain host_regex to approved internal hosts; host_regex is a host allowlist, not a full per-session authorization policy. [S2]
+5. How the implementation was achieved
+5.1 Discovery and baseline assessment
+The investigation started by identifying the OOD host, its app directories, existing cluster definitions and default Desktop application. The native bc_desktop manifest, form.yml, submit.yml.erb and template/desktops scripts showed how standard OOD desktop sessions are normally submitted using Batch Connect. The installed OOD Core Ruby adapter sources were then inspected to understand whether a scheduler-free remote launch was possible.
+Investigation	Observed result	Engineering conclusion
+Linux-host adapter	Launcher used SSH and tmux, but its installed wrapper invoked Singularity/Apptainer even with contain false.	Not a native desktop path without a supported container runtime.
+Systemd adapter	Present in OOD Core; launches transient user services remotely.	Candidate rejected for this host because systemd --user manager and its sockets were unavailable.
+System systemd	PID 1 ran systemd, but no /run/user/[UID]/bus or systemd/private.	System service manager existence does not imply a working user service manager.
+Direct SSH	ssh -T -o BatchMode=yes executed id -un and a Bash script via stdin.	Approved non-interactive remote commands were possible from terminal.
+Detached tmux	tmux -L [SOCKET] new-session -d survived the originating SSH connection.	Needed session persistence without an HPC scheduler.
+Passenger → SSH	A small Rack app successfully ran a fixed read-only remote id -un command.	Web backend could perform the authorized remote action too.
+5.2 Manual desktop validation before OOD integration
+On the desktop host, the team demonstrated that Xvnc could create a virtual display, GNOME could start with DISPLAY pointing to it, and websockify could proxy a browser-compatible WebSocket port to the local VNC port. An OOD reverse-proxy link reached the desktop through noVNC. This separated transport, authentication and desktop readiness issues before the launcher was automated.
+5.3 First OOD application: connection-only proof of concept
+A personal development app with a manifest.yml name, category, description and url was added. Its gateway symlink under /var/www/ood/apps/dev/[USER]/gateway pointed to the owning user’s ~/ondemand/dev directory. OOD discovered the app and displayed “Remote GNOME Desktop POC”; clicking it navigated to a pre-existing noVNC URL. No job form, adapter or process creation was involved. A malformed URL percent-escape initially caused a Ruby format-string error; replacing encoded slashes and restarting the per-user web server resolved it.
+5.4 Second OOD application: Passenger-backed launch controller
+A separate Rack application was created with manifest.yml and config.ru. Initialization registered its route under the PUN; Passenger served a static test page; a fixed SSH probe passed; then Start, Status, Stop and Connect actions were implemented. The original single-user desktopctl used a fixed display :30, VNC TCP 5930 and WebSocket TCP 6081. A wrong websockify forwarding destination (5920 instead of 5930) caused VNC authentication failures until corrected.
+5.5 Shared multi-user launcher
+The single-user implementation was preserved as a reference. A shared launcher in [SHARED_APP_ROOT]/ood-gnome/bin/ was developed, plus desktop.conf for approved websockify executable, bind address and port pool. Multi-user code retained per-user state under ~/.local/state/ood-gnome-multi/. Separate Linux accounts received different allocations: a first example :40 / 5940 / 6081 and a second :41 / 5941 / 6082. These are observed assignments, not permanent per-user reservations.
+5.6 System OOD application and integration fixes
+A new system app was placed under /var/www/ood/apps/sys/remote_gnome_multi. The app selected the effective Linux user, restricted allowed users, validated form POSTs, invoked the shared desktopctl through SSH, and constructed a connection URL using the allocated WebSocket port and current VNC password. Several application-level errors were resolved during integration: Passenger code caching, invalid CSRF regex escaping, an HTTP Origin mismatch, and a failed remote worker caused by an incorrect websockify bind IP.
+5.7 Operational hardening performed or planned
+The original GNOME console stream generated large logs and a stale NFS file remained open after the session ended. The working launcher was modified to discard noisy GNOME stdout/stderr using /dev/null and to truncate worker.log at the beginning of a new startup. This reduces accumulation, but is not a strict per-file size cap. A separate control is still required for other logs, descendant-process cleanup and quota enforcement.
+6. Application and configuration reference
+6.1 File and directory ownership map
+Path	Purpose / what it contains	Reader / consumer	Why inspect it
+/etc/ood/config/ood_portal.yml	Portal Apache settings, host_regex, node_uri/rnode_uri, TLS and authentication integration.	OOD portal generator / Apache	Reverse-proxy errors, host allowlist, TLS routing.
+/etc/ood/config/nginx_stage.yml	PUN staging defaults and optional overrides; many entries can remain commented.	nginx_stage	Per-user app URL routing, staging and restart behavior.
+/etc/ood/config/clusters.d/*.yml	OOD job adapter definitions (LSF/linux_host/systemd, login host, submit host).	OOD Core / Dashboard	Distinguish standard Batch Connect from custom Passenger design.
+/var/www/ood/apps/sys/bc_desktop/	Native Desktop Batch Connect app and templates.	OOD Dashboard / adapter	Reference behavior; not edited for the custom pilot.
+/var/www/ood/apps/sys/remote_gnome_multi/manifest.yml	Name, category, description, app discovery metadata.	Dashboard	Why the app appears in OOD.
+/var/www/ood/apps/sys/remote_gnome_multi/config.ru	Ruby Rack backend; identity allowlist, request checks, SSH command and response page.	Passenger	Start/Connect/Stop failures before remote execution.
+[SHARED_APP_ROOT]/ood-gnome/bin/desktop.conf	Shared websockify executable, approved local bind IPv4 and port pool.	desktopctl	Errno 99 and wrong binding/port selection.
+[SHARED_APP_ROOT]/ood-gnome/bin/desktopctl	One common executable: allocation, worker, lifecycle and password generation.	SSH-launched Bash per user	Remote desktop start/status/stop and readiness.
+~/.local/state/ood-gnome-multi/	Private display allocation, ws_port, password, vnc.passwd, PIDs and startup lock.	desktopctl in user context	Allocation collision and stale lock; protect credentials.
+~/.local/state/ood-gnome-multi/logs/	worker.log, xvnc.log, gnome.log, websockify.log.	Support engineer with owner authorization	Identify first failing process and quota growth.
+/var/log/ondemand-nginx/[OOD_USER]/error.log	Per-user NGINX / Passenger error output.	PUN / Passenger	Ruby exceptions and startup faults.
+~/.vnc/	Legacy VNC config, logs and temporary NFS files.	VNC/session-related user processes	Disk quota, VNC password and orphan file investigation.
+/tmp/.X11-unix/ and /tmp/.X[N]-lock	X11 display socket and display lock.	X server and applications	Display allocation conflict.
+/tmp/ood-gnome-multi-*	Coordinating reservation directories for participating launcher processes.	desktopctl	Resource ownership and stale reservations.
+6.2 Why original bc_desktop was examined but not reused directly
+The stock app had manifest.yml, form.yml (desktop selection, duration, resolution etc.), submit.yml.erb using batch_connect: template: vnc, and template/script.sh.erb plus desktop shell scripts. This is the OOD-native batch-connect model: a configured adapter submits a job that ultimately launches VNC/websockify. The custom office implementation bypassed adapter submission after verifying the installed linux_host wrapper assumed Singularity and systemd --user was unavailable. The stock app remains useful as a reference and future migration path. [S3]
+6.3 Shared desktop.conf: conceptual example
+# Administrator-maintained; never hold passwords here
+WEBSOCKIFY_RUN='[ABSOLUTE_PATH_TO_WEBSOCKIFY_RUN]'
+WS_BIND_IP='[APPROVED_BIND_IPV4_ON_DESKTOP_HOST]'
+WS_PORTS='6081 6082 6083'
+WS_BIND_IP must be an address actually configured on the desktop host interface. “Cannot assign requested address” indicates it is not bindable; it is not the same as a busy port. Verify interface assignment with ip -4 -br addr. The port pool defines candidate listeners but does not itself confer firewall or cybersecurity approval.
+6.4 Desktopctl major commands
+Command	Purpose	State effect
+start	Validate tools; lock; allocate ports; generate VNC credentials; spawn tmux worker.	Creates user-private files and listeners.
+status	Report user/UID, tmux state, display, VNC and WS listeners.	Read-only; do not confuse network-ready with GNOME-ready.
+connect	Return current user’s session WebSocket port and credential to trusted backend.	Sensitive: should not be logged, exposed in shell history or made user-selectable.
+stop	Signal worker and tracked processes; request tmux stop; release allocations.	Incomplete until all descendants and open files close.
+release	Release idle reservations after confirming no active session/listener.	Must not steal another user’s locks.
+worker	Internal detached execution of Xvnc, GNOME and websockify.	Not intended as arbitrary browser action.
+6.5 Key runtime code patterns
+# Example: start Xvnc on an allocated display
+Xvnc ":$DISPLAY_NO" -localhost \
+  -SecurityTypes VncAuth -rfbauth "$STATE/vnc.passwd" \
+  -rfbport "$VNC_PORT" ... &
 
-ruby -c "$APP/config.ru"
+# Start desktop within the virtual X display
+DISPLAY=":$DISPLAY_NO" XDG_SESSION_TYPE=x11 \
+  dbus-run-session -- gnome-session > /dev/null 2>&1 &
+
+# Bridge approved web listener to loopback RFB
+"$WEBSOCKIFY_RUN" "$WS_BIND_IP:$WS_PORT" \
+  "127.0.0.1:$VNC_PORT" ... &
+These excerpts explain behavior, not a drop-in replacement for the deployed script. Ellipses indicate omitted options and process tracking. The production file should be maintained centrally and version controlled.
+6.6 OOD application request handling
+config.ru is the Rack endpoint loaded by Passenger. It must derive the user from the effective non-root Linux process context, validate that the user is allowed, validate action/CSRF/origin for state-changing requests, execute only a fixed allowlisted desktopctl action, verify remote id -un matches the authorized user, and avoid using request parameters to select a different account or arbitrary command.
+The implementation included a session password in a noVNC URL fragment for pilot convenience. This is not proof of safe credential storage. Browser history, local screenshots, extensions, and JavaScript running in the document are potential exposure paths. Production authentication should not rely on this token alone.
+6.7 App discovery and restart behaviors
+System apps live in /var/www/ood/apps/sys/[APP_NAME] and are accessed through /pun/sys/[APP_NAME]. Development apps can be linked via a per-user gateway. Adding a new PUN app can require initialization; changing Ruby code may require Passenger application restart, a PUN restart, or fresh browser navigation. Avoid restarting system Apache to reload only one application. Distinguish stale Passenger code from cached browser content.
+7. Network ports and connectivity matrix
+7.1 Observed VNC pilot ports
+Hop / component	Source → destination	Transport	Port(s)	Exposure / status
+Browser to OOD	User browser → [OOD_FQDN]	HTTPS / WSS over TCP	443	Required externally to portal; authenticated.
+OOD remote launch	[OOD_HOST] → [DESKTOP_HOST]	SSH TCP	22 (or site SSH port)	Observed non-interactive remote exec; must preserve user identity.
+Browser noVNC assets	Browser → [OOD_FQDN]	HTTPS TCP	443	noVNC HTML/JS served by OOD; no extra browser-facing port.
+OOD to websockify A	[OOD_HOST] → [DESKTOP_HOST]	WebSocket proxy backend over TCP	6081	Verified for primary pilot; restrict network source.
+OOD to websockify B	[OOD_HOST] → [DESKTOP_HOST]	WebSocket proxy backend over TCP	6082	Second Linux user was allocated; portal-route/network approval remains a gate.
+OOD to websockify C	[OOD_HOST] → [DESKTOP_HOST]	WebSocket proxy backend over TCP	6083	Reserved for third test; not yet accepted.
+websockify to Xvnc A	[DESKTOP_HOST] → 127.0.0.1	RFB TCP	5940	Local-only display :40; not a firewall opening.
+websockify to Xvnc B	[DESKTOP_HOST] → 127.0.0.1	RFB TCP	5941	Local-only display :41.
+websockify to Xvnc C	[DESKTOP_HOST] → 127.0.0.1	RFB TCP	5942	Illustrative display :42 if allocated.
+PUN socket	Apache ↔ user NGINX	Unix domain socket	None	Local IPC, not a network port.
+7.2 Mapping rules and variable ports
+X11 display :N      → RFB TCP port 5900 + N
+:30                  → TCP 5930  (older fixed POC)
+:40 / :41 / :42      → TCP 5940 / 5941 / 5942 (examples)
+WebSocket proxy port  → independently selected: 6081 / 6082 / 6083
+OOD browser endpoint → HTTPS/WSS TCP 443
+The 5900+N relationship is a conventional VNC display mapping. It is not the websockify port. A single TCP listener can accept multiple clients; the reason to use separate ports is independent session routing and isolation, not a one-client-per-port limit.
+7.3 Data-path examples
+Browser URL (schematic):
+https://[OOD_FQDN]/pun/sys/dashboard/noVNC-1.3.0/vnc.html
+  ?autoconnect=true&host=[OOD_FQDN]&port=443
+  &encrypt=true&path=rnode/[DESKTOP_HOST]/6081/websockify
+
+Browser WebSocket:
+wss://[OOD_FQDN]:443/rnode/[DESKTOP_HOST]/6081/websockify
+
+OOD backend:
+http://[DESKTOP_HOST]:6081/websockify  →  127.0.0.1:5940
+Only the browser-facing connection is automatically protected by the portal HTTPS certificate in this schematic. The OOD-to-websockify leg is a separate trust zone and should not be assumed encrypted. The host_regex allows host targets; a separate authorization mechanism is needed to restrict which port/session each user can reach. [S2, S5]
+7.4 Firewall/change discussion matrix
+Flow	Required decision	Recommended control
+Browser → OOD TCP 443	Existing portal access	Enterprise TLS certificate, SSO/MFA, approved users and monitored ingress.
+OOD → Desktop TCP SSH	Need for non-interactive SSH	Per-user key/certificate controls, minimal commands, host-key validation, centralized audit.
+OOD → Desktop TCP 6081–6083	Network team approval and reachability	Only OOD ingress sources; never open to general user subnets; consider TLS or approved secure tunnel.
+Desktop localhost 5940+	No corporate firewall rule expected if bound to loopback	Prove Xvnc uses -localhost; ensure IPv6 is also loopback-only.
+Outbound licensing DCV (future)	License architecture-dependent	Document actual license-server/API paths separately; not a VNC port.
+7.5 /node versus /rnode and port authorization
+OOD documentation explains that /node and /rnode proxy to a host/port chosen in the URL. A regex restricting hosts is necessary but not sufficient against an authenticated user changing the target port in the URL. This can create an internal-service access path unless port access is separately controlled. Cybersecurity must review this against SSRF/lateral-movement threats and the planned per-session authorization. [S2]
+8. Session lifecycle, identity and multi-user isolation
+8.1 Desired identity contract
+Authenticated user [USER_A] must run the Passenger app under [USER_A]’s non-root UID, connect by SSH as [USER_A], run desktopctl as [USER_A], own session files under [USER_A]’s home, and be unable to read, connect to or stop [USER_B]’s desktop. Identity must not come from an editable username field in a browser form.
+8.2 Multi-user allocation design
+Property	User A observed	User B observed	Required rule
+Linux account	Distinct account A	Distinct account B	UIDs must differ.
+X display	:40	:41	Exclusive reservation and active X11 socket check.
+VNC TCP	5940	5941	Loopback listener and unique display mapping.
+WebSocket TCP	6081	6082	Port lock and owner-aware reverse-proxy policy.
+Session state	Private ~/.local/state/...	Private ~/.local/state/...	Owner-only directories and credentials.
+tmux	User-owned tmux session	User-owned tmux session	Separate tmux server/socket; no shared service account.
+8.3 Reservation locking and concurrency
+The launcher creates private startup locks and coordinates display/WebSocket reservations using atomic directory creation in a shared /tmp namespace. It checks existing X11 locks and listeners before selecting a resource. This reduces collisions among cooperating launchers, but must also handle abandoned reservations, stale files, host reboots, PID reuse, and concurrent independent processes that do not participate in the lock protocol. A robust service should use an atomic reservation registry and explicit ownership validation.
+8.4 Session credential lifecycle
+The pilot creates a VNCAuth password and a hashed VNC password file under a 0700 per-user state directory with 0600 credential files. The original 8-character VNCAuth constraint is a legacy compatibility limitation; even if the password is random, this is not modern SSO/authorization. A credential must be rotated on each fresh session and removed after end-of-session, and should never be placed in shared logs, URLs emailed to others or unprotected storage.
+8.5 Three-user acceptance criteria
+•	User A and User B launch independently; display/ports and PIDs differ; both can see GNOME in their own browsers.
+•	User C launches on the third approved WebSocket port without changing the first two sessions.
+•	Each user can reconnect after closing the browser tab without restarting their desktop.
+•	User A cannot connect to User B by manually changing the /rnode port or copying the WebSocket URL.
+•	User A cannot read User B’s password/connection files or stop User B’s process via app actions.
+•	Stopping A releases A’s VNC/WS listeners and all A session descendants without touching B or C.
+•	Repeated start/stop/restart, quota pressure and unexpected GNOME exit are recoverable without stale locks or leaked processes.
+9. Logs, quotas, process cleanup and NFS behavior
+9.1 Observed quota incident
+The home directory reached its quota and desktopctl could not create ~/.local/state/ood-gnome-multi/.starting. The application reported CONCURRENT_START_OR_STALE_LOCK even when the lock directory did not exist; in that case, the actual mkdir failure was disk quota exceeded. After freeing npm cache space the directory was creatable. A subsequent startup reached the worker but failed due to a wrong websockify binding IP, demonstrating two independent issues.
+9.2 Observed heavy consumers
+Location	Observed size / behavior	Resolution or recommendation
+~/.vnc/.nfs*	Approximately 634 MB for one NFS placeholder file	Held open by orphan GNOME/D-Bus processes from old display :20; release holders safely.
+~/ood-desktop-poc/logs/	Approximately 197 MB	Old single-user POC logs; inspect, truncate or archive after process exit.
+~/.npm/	About 244 MB before cleanup	npm cache clean --force recovered space; unrelated to desktop display pipeline.
+GNOME console log	Repeated D-Bus/GOA/secret-service errors	Redirect GNOME stdout/stderr to /dev/null in new launcher; keep operational fault logs elsewhere.
+worker.log	Could append across launches	Truncate at next start; current session may still grow until additional cap applies.
+9.3 Why deleted files remained on NFS
+An open file that is deleted from NFS-backed storage can be renamed to .nfs[identifier] because the client needs a pathname while a process still holds the file open. Its disk blocks are reclaimed after all references close. A recorded .nfs file remained open by dbus-daemon, evolution-source-registry, goa-daemon, goa-identity-service, mission-control, gvfsd/gvfsd-fuse and gnome-keyring-daemon. One process was adopted by PID 1 and had DISPLAY=:20, indicating an older desktop context. A targeted old process-group termination released the file. The exact process group ID is transient and must never be hardcoded into scripts.
+9.4 Why Stop Desktop can leave descendants
+A tmux worker may start dbus-run-session; GNOME launches activation services that can detach, join another process group or become children of PID 1 when the original leader exits. Killing only Xvnc, gnome-session and websockify PIDs therefore does not guarantee every GNOME child or open file disappears. Conversely, blindly killing all processes owned by the user can break their other sessions. Prefer explicit lifecycle scopes (systemd scopes when available, cgroups, or carefully controlled process groups/session IDs), reaping/timeout logic and per-user isolation validation.
+9.5 Implemented log reduction and its limitations
+# Before: GNOME output grew without bound
+DISPLAY=":$DISPLAY_NO" XDG_SESSION_TYPE=x11 \
+  "$DBUS" -- "$GNOME" > "$LOGS/gnome.log" 2>&1 &
+
+# After: GNOME's inherited console stream discarded
+DISPLAY=":$DISPLAY_NO" XDG_SESSION_TYPE=x11 \
+  "$DBUS" -- "$GNOME" > /dev/null 2>&1 &
+
+# Before spawning a fresh worker, reset its historical log
+: > "$LOGS/worker.log"
+The modification reduces the stream written to gnome.log and prevents worker.log accumulation across launches. It does not automatically cap xvnc.log, websockify.log, any internal GNOME file output, or the current session’s worker.log. These remaining files require a defined retention limit and tests under repeated startup failures.
+9.6 Safer log policy for a small user quota
+•	Keep launch failure details for a bounded time; do not discard all stderr across every component.
+•	Restrict standard logs to a small maximum per component (for example 2–5 MB each, with two rotations), and ensure the policy runs at a predictable interval.
+•	To avoid .nfs placeholders, use copytruncate or supported reopen-on-signal behavior when a log is actively written; validate that it does not corrupt valuable diagnostic events.
+•	Archive technical failure evidence outside quota-constrained homes only with approved storage classification and retention.
+•	Alert at a defined quota threshold; handle ENOSPC/EDQUOT explicitly and report “quota exhausted” rather than a generic stale-lock message.
+10. Troubleshooting knowledge base
+10.1 Symptom → root cause → corrective action
+Symptom / observed message	Root cause or strongest evidence	Check / corrective approach
+OOD All Apps: malformed format string - %F	Unescaped percent sequence in custom manifest URL collided with Ruby formatting.	Use plain slash or properly escaped URL format; reload PUN/Passenger.
+App has not been initialized	PUN route not yet staged for the new Passenger application.	Initialize App in browser after saving OOD shell work.
+Request rejected / ORIGIN	HTTP Origin did not match configured portal origin; observed Origin: null.	Inspect DevTools POST headers; correct referrer/origin handling, preserve CSRF.
+Invalid CSRF token (RuntimeError)	CSRF validation regex was incorrectly escaped in generated Ruby code.	Correct regex and inspect token file format; syntax check alone is insufficient.
+Passenger “something went wrong”	Ruby app could not spawn / load; see error.log for stack trace.	Inspect per-user NGINX/Passenger log; restart only affected app after fix.
+SSH “stdin is not a terminal”	Installed linux_host adapter used ssh -t with piped stdin; not a proven workable path.	Use validated, approved ssh -T flow for custom app rather than altering security controls.
+Systemctl --user: no D-Bus connection	User manager/socket absent despite systemd PID 1.	Do not assume systemd adapter is viable; validate user manager and security policy.
+No such file or directory: ss	Non-interactive SSH PATH differed from login shell.	Use verified absolute command path such as /usr/sbin/ss.
+noVNC Authentication failure	websockify pointed to older VNC port or wrong session credential.	Confirm proxy target and actual Xvnc port; do not assume password itself wrong.
+noVNC Failed to connect	WebSocket handshake/routing/listener mismatch.	Check browser console WS URL, Apache /rnode, TCP listener and proxy.
+DESKTOP_WORKER_EXITED	Detached worker terminated before network ready.	Inspect worker.log, xvnc.log and websockify.log to find first failure.
+OSError: [Errno 99] Cannot assign requested address	WS_BIND_IP was not configured on desktop host interface.	Inspect ip -4 -br addr; set actual local bind IPv4.
+CONCURRENT_START_OR_STALE_LOCK	Lock existed OR mkdir failed due to exhausted quota.	Check state directory, quota, tmux and active worker before touching lock.
+GNOME black screen up to ~1 minute	Xvnc became reachable before GNOME shell/D-Bus initialization.	Distinguish network readiness from desktop visual readiness; inspect GNOME startup.
+Large .nfs file persists after Stop	Deleted NFS file still held by old GNOME/D-Bus processes.	fuser -v on file; identify DISPLAY/process group; terminate only obsolete session.
+VNC unsupported -Log option	OOD VNC template options differed from installed TigerVNC version.	Do not patch vendor gems blindly; adapt template or use custom launcher.
+Coder API connection refused in sessions page	Unrelated existing app session error polluted Dashboard view.	Differentiate Coder diagnostics from VNC lifecycle failure.
+10.2 Layer-by-layer diagnostic decision tree
+Does OOD application page render? If NO → Passenger / config.ru / PUN logs
+Does Launch report accepted? If NO → Origin / CSRF / user allowlist
+Does remote desktopctl start? If NO → SSH identity / sudo-free access / command path
+Does tmux worker survive? If NO → worker.log / startup locks / quota
+Is Xvnc listening? If NO → xvnc.log / display locks / credentials
+Is websockify listening on assigned IP? If NO → websockify.log / bind address / port
+Does browser WebSocket connect? If NO → Apache /rnode / host_regex / routing / TCP
+Does desktop render? If NO → GNOME / D-Bus / X11 environment
+Does Stop release all resources? If NO → process descendants / NFS open files
+
+10.3 Short diagnostic command library
+The commands below are intentionally short for manual typing. Execute them on the relevant host and from the indicated directory; never replace placeholders with credentials in shared documentation.
+# [DESKTOP_HOST], show assigned addresses
+ip -4 -br addr
+
+# User home and identity
+id -un
+id -u
+quota -s
+
+# Enter private session state and inspect status
+cd ~/.local/state/ood-gnome-multi
+ls -la
+
+# Enter logs (the launcher creates this directory)
+cd logs
+tail worker.log
+tail xvnc.log
+tail websockify.log
+
+# Listener and tmux
+ss -ltn
+ps -ef | grep '[X]vnc'
+tmux -L ood_gnome_multi ls
+
+# NFS file and process inspection
+cd ~/.vnc
+fuser -v .nfs*
+ps -p [PID] -o pid,ppid,pgid,args
+
+# [OOD_HOST], source lint / app load
+ruby -c config.ru
+# inspect under /var/log/ondemand-nginx/[OOD_USER]/
+tail error.log
+10.4 Operational troubleshooting principles
+•	Never assume a running TCP port proves a healthy desktop. Distinguish Xvnc readiness, websockify readiness and GNOME readiness.
+•	Never kill arbitrary process groups without verifying the owner, DISPLAY, members and whether another session still depends on them.
+•	Use absolute executable paths in automation to avoid PATH mismatches.
+•	Never delete credentials or reservation records until stopped processes and listeners are verified; stale states need ownership-aware recovery.
+•	A browser’s noVNC rejection is not always an incorrect password: an old proxy target produces the same symptom.
+•	A failure after clicking Launch can be in HTTP security validation, remote execution, session startup or browser connection. Diagnose in order.
+11. Cybersecurity assessment and decisions
+11.1 Security objective and trust boundaries
+The remote desktop exposes graphical content, keystrokes, clipboard data and potentially sensitive engineering information. OOD identity controls the portal, but the session passes through multiple trust zones: user browser, enterprise ingress, OOD app backend, SSH execution, network proxy backend and an RFB desktop service. Each boundary requires distinct controls. Only controls evidenced as implemented should be credited during risk acceptance.
+Boundary 1 — Browser → OOD HTTPS: enterprise login, session cookie, MFA, TLS
+Boundary 2 — PUN / Passenger: effective UID, POST/CSRF/origin, allowed actions
+Boundary 3 — SSH: per-user remote account, known host, constrained execution
+Boundary 4 — Desktop state: UID ownership, 0700 / 0600 files, ports / locks
+Boundary 5 — Apache /rnode: host + per-session port authorization
+Boundary 6 — WebSocket → VNC: encryption, password handling, input controls
+Boundary 7 — GNOME / storage: app data, process cleanup, clipboard/file policy
+
+11.2 Security review checklist — decisions to take to cybersecurity
+Review topic	Question to resolve	Pilot position / risk
+User authentication	Is enterprise SSO/MFA at OOD ingress sufficient, and can the portal identity be trusted to map to Linux UID?	OOD login exists; exact IdP and MFA not established here.
+End-to-end confidentiality	Is plaintext backend WebSocket from OOD to websockify acceptable on the internal network?	Pilot backend was unencrypted; approve TLS/tunnel/mTLS or trusted segmentation explicitly.
+VNCAuth weakness	Is legacy VNCAuth with short password permitted for sensitive desktops?	Eight-character generated password is not a modern auth boundary.
+VNC password in URL fragment	Can browser scripts/history/screenshots/endpoint tooling expose it?	Pilot handoff uses #password; replace with safer brokered one-time session/auth flow if required.
+Reverse proxy target authorization	Can a user edit /rnode/[HOST]/[PORT] to reach another desktop or unrelated service?	host_regex constrains hosts, not necessarily port and owner. This is a critical gap.
+WS listener access	Who can connect directly to 6081–6083 on the desktop host?	Restrict ingress to [OOD_HOST]; verify no user-subnet reachability.
+Shared script integrity	Can ordinary users replace desktopctl or desktop.conf through a writable parent directory or NFS group ACL?	Must be admin-owned/controlled at every path component.
+SSH delegated execution	Can the app invoke arbitrary commands or run as another user?	Current design uses SSH user and fixed action allowlist; enforce key and command policy.
+Session ownership	Can A read B’s state, connect to B or Stop B’s session?	Separate UID/state checked on Linux; full browser/proxy negative test pending.
+User data controls	Should clipboard, file transfer, screenshots, USB or printing be blocked?	noVNC/VNC capabilities and GNOME clipboard require policy review.
+Audit trail	Which identities, launch IDs, source IPs and decisions are logged?	Need bounded retention without logging VNC passwords.
+Quota / availability	Can one noisy process exhaust NFS quota and block all sessions?	Observed EDQUOT and ~634 MB NFS open file; controls required.
+Software lifecycle	Are bundled noVNC, TigerVNC, websockify, GNOME and host OS patched/supportable?	Legacy versions observed; upgrade assessment required.
+Operational stop	Can stopped sessions leave descendants/credentials accessible?	Yes in observed old GNOME session; cleanup design incomplete.
+Denial of service	Can repeated launches consume ports, sessions, CPU/memory/GPU?	Need admission limits, rate limiting and quota.
+Data classification	Is the desktop suitable for export-controlled/sensitive project content?	Decide before expanding user population; portal access does not imply data approval.
+11.3 Detailed threats and compensating controls
+Threat	Example abuse/failure	Mitigation to consider
+Cross-session access	User changes /rnode path to another user’s WebSocket port.	Server-side ownership binding, per-session authorization tokens, restricted backend listener, negative tests.
+Credential disclosure	VNC password appears in fragment, screenshot, browser extension or history.	Short-lived capability, one-time tokens, no reuse, no sensitive debug output, endpoint policy.
+Transport eavesdropping	Backend WebSocket or RFB traverses untrusted subnet.	TLS backend, authenticated tunnel/sidecar or approved network isolation.
+Code tampering	Group-writable shared filer lets user replace launcher.	Admin-owned signed/versioned deployment, read/execute only, audit integrity.
+Privilege confusion	OOD user passed from browser overrides SSH account.	Use Process.euid; no user field; remote id -un enforcement.
+Host routing/SSRF	OOD proxy reaches unapproved internal host or port.	Narrow host_regex plus port allowlist / per-session ACL, firewall egress controls.
+Resource exhaustion	Infinite GNOME log, stale NFS file, leaked ports/locks.	Bound logs, timeouts, lifecycle cgroup/process scopes, quota alerts.
+Orphan processes	dbus-daemon/goa-daemon survive Stop.	Session-scoped process tracking/cleanup and stop acceptance test.
+Stale browser authorization	Old valid connection link reused after session restart.	Rotate auth, invalidate old tokens, stop backend listener, session expiry.
+Legacy components	Old VNC/proxy releases accumulate known vulnerabilities.	Security-supported versions, patch scans, change-window upgrade plan.
+11.4 Hardening actions, prioritized
+•	P0 — Restrict reverse-proxy host and port access so an authenticated user cannot reach someone else’s desktop or arbitrary backend service.
+•	P0 — Confirm HTTPS certificate validity, SSH host-key checking, user-specific SSH credentials, and network-team restriction for the websockify listener pool.
+•	P0 — Preserve a deny-by-default action allowlist and robust CSRF validation; never disable these controls just to pass a test.
+•	P0 — Protect launcher + config at every parent directory and validate that users cannot modify shared executable code.
+•	P1 — Replace or supplement legacy VNCAuth and URL-fragment credential handoff; determine the allowed sensitivity of data displayed.
+•	P1 — Implement precise session-scoped process cleanup; verify no orphan GNOME/D-Bus services or held NFS logs.
+•	P1 — Set per-user concurrency, memory/CPU, idle timeout, quotas and bounded logging.
+•	P1 — Inventory, patch and support TigerVNC, websockify, noVNC, Python and base OS.
+•	P2 — Add structured audit events, health metrics, runbooks and security regression tests.
+11.5 What a cybersecurity meeting should approve
+Document at minimum: data classification, identities and login method; client ingress; SSH flow; portal-to-desktop WebSocket encryption; allowed host/port proxy routes; VNC authentication and password distribution; session ownership/access rules; clipboard and file transfer policy; log retention and protected storage; software baselines; network rules; supported OS; incident response; and risk owner/sign-off. Separate approval for a limited pilot from approval for broader production use.
+11.6 Important warning on VNC and browser-accessible credentials
+noVNC is a browser VNC client, not an identity provider. websockify is a transport bridge, not a session authorization service. GNOME is a desktop environment, not a network authentication gateway. Security of the end-to-end service must be established across all layers. In the pilot, the Connect link was generated by a trusted backend; however /rnode and the backend port remain independently reachable paths unless explicitly constrained.
+
+ 12. Amazon DCV: product architecture and features
+12.1 What Amazon DCV is
+Amazon DCV (formerly NICE DCV) is a remote visualization technology with an integrated desktop streaming server and both browser and native clients. It is designed for interactive desktops and high-performance graphics workloads. Unlike the VNC pilot, the DCV server provides its own session protocol, streaming endpoints and client authentication/authorization features; it does not require noVNC or websockify. [S6]
+12.2 DCV architecture
+Browser or native DCV client → DCV server endpoint (default TCP 8443)
+↓ TLS / WebSocket for browser; optional QUIC UDP for supported native clients
+DCV server → DCV session authentication and authorization
+↓ Console or Linux virtual session → Xdcv / graphics pipeline
+↓ Linux desktop / graphical engineering applications / optional GPU
+
+If OOD is retained as the entry portal, it may act as an app launcher or provisioning frontend, but DCV session establishment and client streaming remain DCV-specific. The existing /rnode WebSocket path is not automatically a supported DCV gateway; any proxy or gateway architecture must be validated for TLS, WebSockets, authentication and, where relevant, QUIC.
+12.3 Console versus virtual sessions
+Property	Console session	Virtual session
+What is shown	Existing physical/console display	Dedicated virtual display per session (Xdcv on Linux)
+Concurrent sessions	Generally one console session per server	Multiple on supported Linux servers
+Typical use	Physical console / GPU workstation	Multi-user hosted virtual desktops
+Who creates	Administrative role per DCV config	Supported per-user/admin creation; verify owner and privileges
+Graphics acceleration	Uses existing console graphics capabilities	GPU/OpenGL support may require DCV-GL and compatible hardware
+Applicability to our design	Less aligned to three independent users	Primary candidate for replacing one-Xvnc-per-user
+Amazon documents that console and virtual sessions cannot coexist on a single DCV server at the same time, and that Linux can host multiple virtual sessions. Supported display-server behavior depends on OS/DCV version. [S7]
+12.4 Native versus browser client
+Client	Transport	Implications
+Web browser	DCV web client over HTTPS/WebSocket (TCP)	Simple browser access; web browser client does not support QUIC UDP.
+Native desktop client	WebSocket TCP, with optional QUIC UDP if enabled and directly reachable	Potential responsiveness/bandwidth benefit; additional client installation and UDP policy.
+Access through proxy/gateway	Depends on DCV’s supported product gateway/access stack	Must confirm compatibility; a generic HTTP reverse proxy cannot transparently forward QUIC.
+12.5 Features and engineering workload relevance
+•	Adaptive image/video encoding and optional hardware-assisted encoding for high-resolution interactive applications.
+•	Linux virtual sessions for multiple users on a capable host; optional GPU sharing on supported configurations.
+•	Policy-controlled clipboard, file transfer, printing, audio, USB/smart-card/WebAuthn and collaboration capabilities (by platform/client).
+•	TLS certificate management and session authentication/authorization separate from the OOD portal.
+•	Native and HTML5 clients with different transport and peripheral feature sets.
+•	Enterprise deployment considerations: supported OS, GPU drivers, session memory/CPU, licensing, authentication and operational support.
+Feature availability varies by DCV release, guest OS, GPU and client type; do not promise a function until verified on the actual target platform. [S6, S8]
+12.6 Supported operating systems and release alignment
+As of 18 November 2026, Amazon DCV 2026.0 is available. Current documented Linux server platforms include modern RHEL 8.x/9.x/10.x, Rocky Linux, supported Ubuntu and SUSE variants; an end-of-life RHEL 7 host is not in the current supported server list. Therefore DCV must not simply be installed on the legacy desktop host without an OS/support validation and an approved migration or alternate execution host. [S9]
+12.7 Authentication and authorization
+On Linux, DCV can use system authentication through PAM (default service file commonly /etc/pam.d/dcv), or a supported external authentication integration. DCV also has a session permission model; the default permissions file grants the owner broad rights. Authentication answers “who are you?” while authorization answers “what can you do in this session?” OOD identity and DCV identity must be mapped explicitly if the two products are integrated. [S10, S11]
+12.8 Licensing
+DCV on EC2 has different license conditions from a deployment on a conventional on-premises host. Non-EC2 use can require a license/license server, and session concurrency may be constrained. License procurement, reachability and compliance must be confirmed before a proof of concept on non-EC2 hardware. [S12]
+13. DCV ports, dependencies and integration patterns
+13.1 Core DCV port matrix
+Flow	Port/protocol	Required?	Notes
+DCV browser/native client → DCV server	TCP 8443 default	Yes for direct client use	HTTPS/WebSocket; web-port configurable; not identical to VNC 59xx.
+DCV native client → DCV server QUIC	UDP 8443 default	Optional	Only if QUIC enabled/supported; no QUIC in DCV browser client.
+OOD browser → OOD portal	TCP 443 default	If OOD remains entry point	Existing portal HTTPS/SSO; distinct from DCV 8443.
+OOD integration → execution control	SSH TCP 22 or approved API	Design-specific	Needed only if chosen provisioning pattern uses SSH.
+DCV Session Manager agent → broker	TCP 8445 default	Only with Session Manager	Additional management plane, not basic DCV streaming.
+DCV gateway → broker	Site/product-defined; 8447 often documented	Only with gateway architecture	Verify exact current release topology and default values.
+DCV license server / external auth	Environment-specific	On-prem/config-dependent	Do not invent port; obtain from license and identity owners.
+Unlike the VNC pilot, DCV has one standard server listening port per server instance, while multiple virtual sessions can be distinguished using session IDs and authorization. A separate 8443 port per user is not normally required. [S13, S14]
+13.2 Core installation and process inventory
+Component	Linux location/service	Purpose / reader
+DCV server configuration	/etc/dcv/dcv.conf	Defines listener, certificate, security and session parameters; read by DCV server.
+DCV service	dcvserver service / installed binaries	Long-lived DCV server; managed by system service manager.
+PAM configuration	/etc/pam.d/dcv	Auth policy when DCV system authentication is selected.
+Session management CLI	dcv list-sessions, dcv create-session, dcv close-session	Inspect/create/terminate DCV sessions with appropriate permissions.
+DCV logs	Vendor-defined DCV log directories, version-specific	Server and session diagnostics; verify installed package layout.
+Optional DCV-GL	Vendor package	GPU/OpenGL acceleration for supported virtual sessions.
+Optional Session Manager	Broker/Agent/Gateway components	Central provisioning, tokens and fleet management; not mandatory for basic host.
+13.3 Minimal DCV concepts / commands (not executed in current environment)
+# Read-only product check (only if DCV is installed)
+command -v dcv
+dcv list-sessions
+
+# Review server configuration (admin-approved)
+sudo grep -n 'web-port' /etc/dcv/dcv.conf
+
+# Illustrative Linux virtual session creation:
+# Requires supported OS, installed/running DCV and proper permissions.
+dcv create-session --type virtual --owner [USER] [SESSION_ID]
+
+# Example browser URL for a direct DCV endpoint:
+https://[DCV_HOST]:8443/#[SESSION_ID]
+Do not run create-session on an unsupported host or assume the currently installed GNOME/RHEL version is compatible. Confirm session ownership, DCV service permissions, license and display implementation first. [S7]
+13.4 Integration options with OOD
+Option	Flow	Advantages	Trade-offs / validation
+A — OOD as launch catalog	OOD app shows link to an already-running DCV session/server	Low code; easy comparison of UX	Separate login; browser must reach DCV TCP 8443; user/URL association.
+B — OOD custom session creator	OOD Passenger app provisions DCV virtual session using approved API/CLI, then links client	Keeps portal entry and per-user controls	Privilege/identity mapping, secure token creation, session ownership, lifecycle and certificates.
+C — DCV Session Manager/Gateway	OOD interfaces with broker + tokenized access gateway	Fleet-scale central session management and gateway	More products, ports, TLS/certs, licensing, HA, integration scope.
+D — Native DCV client delivery	OOD portal launches native-client connection descriptor or link	Best fit for QUIC and advanced client features	Client installation, endpoint management and UDP network validation.
+13.5 Security discussion for DCV
+•	Confirm TLS trust and server certificate management; do not ask users to bypass certificate warnings.
+•	Choose system PAM or external auth and map OOD login to a DCV session owner without trusting a browser-supplied user field.
+•	Authorize session IDs, owners and feature permissions (clipboard, file transfer, printing, USB, screen capture if applicable).
+•	Validate network flows and whether QUIC UDP is desired; browser clients will use TCP/WebSocket only.
+•	Understand licensing, GPU resources, supported OS/driver matrix and patch ownership.
+•	Define audit retention, idle/disconnect policies and cleanup behavior for session manager / broker if deployed.
+14. VNC versus DCV: engineering comparison
+Dimension	Current VNC/noVNC pilot	Amazon DCV (proposed)
+Browser client	noVNC served by OOD	Built-in DCV browser viewer
+Server protocol	RFB over TCP, bridged to WebSocket	DCV streaming over HTTPS/WebSocket; optional QUIC for native clients
+Server process	Xvnc + GNOME + separate websockify	DCV server + session; Xdcv for Linux virtual sessions
+Typical TCP ports	443 ingress; 6081–6083 WS; 5940+ loopback	8443 by default for direct DCV; 443 if OOD portal separately used
+UDP ports	Not required by current pilot	8443 optional for QUIC/native client, not browser
+User isolation	Custom launcher, private state, separate UID/ports	DCV-owned session IDs/permissions; integration still needs identity validation
+Authentication	OOD + SSH + legacy VNCAuth	DCV PAM/external auth + permissions; may integrate with OOD identity
+TLS to desktop backend	Not established in current pilot backend leg	DCV server supports TLS; certificate and gateway design required
+Graphics optimization	Dependent on VNC/TigerVNC encoding and display	Designed for interactive high-performance graphics with adaptive encoding/GPU capabilities
+Hardware/GPU	GNOME/Xvnc behavior; no demonstrated GPU acceleration	Supported GPU acceleration/virtual sessions subject to license/OS/driver
+Collaboration/peripherals	VNC features depend on stack and configuration	Broader documented audio/clipboard/file/device capabilities by client/OS
+Operations	Custom tmux/SSH lifecycle and cleanup; multiple scripts	Server/session management and possible Broker/Gateway, more vendor stack
+Legacy OS	Pilot demonstrated on current execution host, support status uncertain	Current DCV server docs do not list RHEL 7
+Licensing	Open components; enterprise support still a concern	License required in many non-EC2 deployments
+Current result	Working OOD-launched desktop for primary user	Not yet installed or benchmarked
+14.1 Experience and performance test proposal
+Do not choose DCV solely on a brochure claim. Compare identical workloads on supported hosts, at the same resolution and network conditions. Test browser launch time, first interactive desktop time, frame responsiveness during 3D rotation, input latency, bandwidth consumption, CPU/GPU load, clipboard/file transfer policy, recovery from disconnect, and multi-user density. Document result distribution and configuration, not only anecdotal “feels faster”.
+14.2 When VNC can remain suitable
+A narrowly restricted, low-density engineering desktop pilot with modest graphics workload can be served by VNC/noVNC if identity, reverse-proxy authorization, encrypted transport and lifecycle controls are hardened and tested. Its advantage is low additional software complexity and reuse of already working OOD browser connectivity.
+14.3 When DCV deserves priority
+DCV should be evaluated if the goal includes demanding graphics/3D CAE, reliable session lifecycle at scale, native-client experience, GPU usage, or stronger integrated session authorization and policy options. This benefit must be weighed against OS support, licensing, network policy, the extra client endpoint/gateway and operational support requirements.
+15. Decision gates and next-phase plan
+15.1 Proposed next phase: DCV feasibility, not immediate migration
+Gate	Evidence needed	Owner to involve	Output
+Supportability	Execution OS/DCV version support; GPU/driver; target host inventory	Linux platform + vendor support	Supported target platform selected.
+Network	TCP 8443; optional UDP 8443; ingress routing / gateway placement	Network + cybersecurity	Approved connectivity matrix.
+Security	DCV PAM/external auth, session owner rights, TLS, client capabilities	IAM + cybersecurity	Approved auth and data-access design.
+Licensing	On-prem license type, concurrency, license service and cost	Procurement / licensing	Commercial feasibility.
+OOD integration	Direct link versus custom provisioning versus Session Manager	OOD engineering	Architecture decision and POC plan.
+Performance	2–3 user concurrent CAE scenario vs VNC benchmark	Engineering users + performance team	Evidence-based recommendation.
+Operations	Logging, cleanup, quota, observability, rollback	Service operations	Support and lifecycle readiness.
+15.2 Go / no-go criteria for VNC pilot expansion
+•	Confirmed per-user OOD login identity and remote SSH identity mapping for every pilot user.
+•	Negative access test: users cannot reach each other’s session or arbitrary backend ports.
+•	Correct bound listeners and network segmentation; approved TCP flows only.
+•	VNC credential delivery reviewed and accepted; appropriate data-classification restrictions.
+•	Stop, timeout, crash and reconnect behavior release all processes/files and do not affect neighboring users.
+•	Home quotas preserved by bounded log policy and open-file cleanup; no persistent large .nfs files.
+•	Three concurrent sessions stable with measurable resource utilization.
+15.3 Architecture choice recommendation
+Maintain the working VNC OOD pilot as a controlled engineering reference while assessing DCV on a vendor-supported OS. Treat DCV as an alternative desktop transport/session architecture, not as a drop-in replacement for the noVNC link. Do not expose the multi-user pilot broadly until the security and cleanup gates are accepted.
+16. Operational command reference
+16.1 Layered commands and why each matters
+Where	Command	What it proves
+[OOD_HOST]	ruby -c config.ru	Rack app Ruby syntax only, not runtime behavior.
+[OOD_HOST]	tail error.log	Passenger/NGINX errors from relevant log directory.
+[DESKTOP_HOST]	id -un	Executing account; protects owner mapping.
+[DESKTOP_HOST]	ip -4 -br addr	Which addresses the host can bind to.
+[DESKTOP_HOST]	ss -ltn	Listening TCP endpoints and port state.
+[DESKTOP_HOST]	tmux -V	tmux available/version.
+[DESKTOP_HOST]	ps -ef | grep [X]vnc	Xvnc process and display (pattern example).
+[DESKTOP_HOST]	quota -s	Quota exhaustion during allocation/lock creation.
+[DESKTOP_HOST]	du -sh ~/.vnc	Legacy VNC space consumed.
+[DESKTOP_HOST]	fuser -v .nfs*	Processes holding NFS placeholder files open.
+[DESKTOP_HOST]	tail worker.log	First remote worker failure after tmux startup.
+[DESKTOP_HOST]	tail websockify.log	Binding/routing errors (e.g., Errno 99).
+[DESKTOP_HOST]	tail xvnc.log	Display and RFB listener readiness.
+[DESKTOP_HOST]	tail gnome.log	Desktop/D-Bus startup issues, if enabled.
+16.2 Short command workflows by scenario
+Scenario A — Remote app does not start
+cd [SHARED_APP_ROOT]/ood-gnome/bin
+bash -n desktopctl
+./desktopctl status
+./desktopctl start
+Scenario B — Check user-private runtime
+cd ~/.local/state/ood-gnome-multi
+ls -la
+cd logs
+tail worker.log
+Scenario C — Browser shows black screen
+ss -ltn
+ps -ef | grep "[g]nome-session"
+# GNOME may still be initializing after Xvnc is listening
+Scenario D — NFS deleted log remains large
+cd ~/.vnc
+ls -lh .nfs*
+fuser -v .nfs*
+# Identify session ownership and file holders before termination
+Scenario E — DCV future pilot
+command -v dcv
+dcv list-sessions
+# Avoid attempting install/start on a vendor-unsupported OS
+17. Glossary
+Term	Meaning
+OOD	Open OnDemand web access platform for HPC and interactive applications.
+VDI	Virtual Desktop Infrastructure; used here to describe a remotely delivered desktop, not a specific hypervisor solution.
+Apache	Portal web server and authenticated front-end reverse proxy.
+PUN	Per-User NGINX: OOD NGINX server running in an individual user context.
+Passenger	Application server/process manager hosting Ruby Rack application.
+Rack / config.ru	Ruby HTTP application interface and application entry point.
+SSH -T	SSH without allocating a remote pseudo-terminal.
+tmux	Terminal multiplexer that keeps detached sessions running.
+X11 / DISPLAY	Window system; DISPLAY=:N identifies a particular virtual/physical X server.
+Xvnc	Virtual X server with a VNC RFB endpoint.
+RFB	Remote Framebuffer protocol used by VNC.
+noVNC	Browser VNC client implemented in JavaScript.
+websockify	WebSocket-to-TCP bridge for VNC.
+WebSocket / WSS	Bidirectional browser protocol / WebSocket secured with TLS.
+VNCAuth	Legacy challenge/response authentication used by common VNC servers; not equivalent to enterprise SSO.
+D-Bus	Local interprocess message bus used by GNOME and other desktop services.
+PGID / PID / PPID	Process group ID / process ID / parent process ID.
+NFS .nfs file	Temporary file created when an NFS client unlinks a file while it is still open.
+EDQUOT	Disk quota exceeded; may cause mkdir failures and misleading stale-lock symptoms.
+CSRF	Cross-Site Request Forgery; server must verify authorized state-changing browser requests.
+Origin	HTTP request origin; relevant for form submission security.
+DCV	Amazon DCV, previously NICE DCV, remote visualization technology.
+QUIC	UDP-based transport used optionally by supported native DCV clients.
+Xdcv	DCV-managed virtual display server for Linux virtual sessions.
+PAM	Pluggable Authentication Modules on Linux.
+Cgroup	Linux kernel control group mechanism used to track/control process groups/resources.
+18. Official sources and verification notes
+The references below support product behavior, defaults, security concepts and vendor requirements. Local paths, observed versions, failures and fixes elsewhere in this document derive from the implementation history and screenshots, not from these vendor sources. Current details were checked on 18 November 2026.
+[S1] Open OnDemand Architecture.  https://osc.github.io/ood-documentation/latest/architecture.html
+[S2] Open OnDemand ood_portal.yml — reverse proxy /rnode and host_regex.  https://osc.github.io/ood-documentation/latest/reference/files/ood-portal-yml.html
+[S3] Open OnDemand Batch Connect VNC Options.  https://osc.github.io/ood-documentation/latest/reference/files/submit-yml/vnc-bc-options.html
+[S4] Open OnDemand nginx_stage.yml.  https://osc.github.io/ood-documentation/latest/reference/files/nginx-stage-yml.html
+[S5] Open OnDemand Security.  https://osc.github.io/ood-documentation/latest/security.html
+[S6] Amazon DCV Overview.  https://docs.aws.amazon.com/dcv/latest/adminguide/
+[S7] Amazon DCV Session Types and Session Creation.  https://docs.aws.amazon.com/dcv/latest/adminguide/managing-sessions-intro.html
+[S8] Amazon DCV Client and Server Features.  https://docs.aws.amazon.com/dcv/latest/adminguide/servers.html
+[S9] Amazon DCV 2026.0 release and supported systems.  https://aws.amazon.com/about-aws/whats-new/2026/10/amazon-dcv-2026-0/
+[S10] Amazon DCV Linux Authentication.  https://docs.aws.amazon.com/dcv/latest/adminguide/security-authentication.html
+[S11] Amazon DCV Authorization Permissions.  https://docs.aws.amazon.com/dcv/latest/adminguide/security-authorization.html
+[S12] Amazon DCV Licensing.  https://docs.aws.amazon.com/dcv/latest/adminguide/setting-up-license.html
+[S13] Amazon DCV Default Ports.  https://docs.aws.amazon.com/dcv/latest/adminguide/manage-port-addr.html
+[S14] Amazon DCV Browser Connection and QUIC Limitation.  https://docs.aws.amazon.com/dcv/latest/userguide/using-connecting-browser-connect.html
+[S15] Amazon DCV Session Manager Network Requirements.  https://docs.aws.amazon.com/dcv/latest/sm-admin/requirements.html
+[S16] Open OnDemand Interactive Software Requirements.  https://osc.github.io/ood-documentation/latest/how-tos/app-development/interactive/setup/software-requirements.html
+[S17] Amazon DCV Release Notes.  https://docs.aws.amazon.com/dcv/latest/userguide/doc-history-release-notes.html
+18.1 Differences between demonstrated behavior and recommendations
+Classification	Examples
+Demonstrated	OOD page and Launch path for primary account; SSH -T; tmux detached worker; Xvnc/WS ports; two Linux account allocations; Errno 99 fix; NFS cleanup.
+Implementation code supplied	Shared desktopctl and config.ru; CSRF/Origin controls; allocation and connection handoff; GNOME stdout reduction.
+Not yet independently validated	All three OOD users at once; negative cross-port access; rootless complete descendant cleanup; strict log size caps; TLS on backend leg.
+Future product evaluation	DCV 2026.0 on supported host, licensing, GPU UX, PAM/external auth, DCV Session Manager/Gateway topology.
+18.2 Security and change-control note
+This document intentionally uses placeholders. Do not paste private hostnames, public keys, tokens, VNC passwords, certificates, internal IP addresses, exact shared filer identifiers or restricted project data into broadly accessible documentation. Validate all proposed changes under local change control before exposing sessions to colleagues.
+END OF TECHNICAL REFERENCE

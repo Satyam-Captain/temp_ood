@@ -1,16 +1,25 @@
-<% if defined?(host) && defined?(port) &&
-      host.to_s == "127.0.0.1" &&
-      port.to_i.between?(1024, 65535) %>
+def read_coder_output(latest_build)
+  resources = Array(latest_build["resources"])
 
-  <a class="btn btn-primary"
-     target="_blank"
-     href="/rnode/<%= host %>/<%= port %>/">
-    Connect to VS Code
-  </a>
+  metadata = resources.find { |r|
+    r["name"] == "coder_output"
+  }&.dig("metadata")
 
-<% else %>
+  if Array(metadata).empty?
+    workspace = resources.find { |r|
+      r["name"] == "workspace" &&
+      r["type"] == "docker_container"
+    }
 
-  <p>VS Code connection details are not ready.
-     Refresh My Interactive Sessions.</p>
+    candidate = Array(workspace&.dig("metadata"))
+    keys = candidate.map { |m| m["key"] }
 
-<% end %>
+    if %w[floating_ip port].all? { |k| keys.include?(k) }
+      metadata = candidate
+    end
+  end
+
+  Array(metadata).to_h { |m|
+    [m["key"].to_sym, m["value"]]
+  }
+end

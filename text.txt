@@ -1,16 +1,16 @@
+<% if defined?(host) && defined?(port) &&
+      host.to_s == "127.0.0.1" &&
+      port.to_i.between?(1024, 65535) %>
 
-warn "OOD DEBUG original=#{coder_output_hash.inspect}"
+  <a class="btn btn-primary"
+     target="_blank"
+     href="/rnode/<%= host %>/<%= port %>/">
+    Connect to VS Code
+  </a>
 
-resources = Array(latest_build["resources"])
-warn "OOD DEBUG original_resources=#{resources.map { |r| [r['name'], r.keys] }.inspect}"
+<% else %>
 
-if coder_output_hash.empty? && latest_build["id"]
-  url = "#{@host}/api/v2/workspacebuilds/#{latest_build['id']}"
-  fresh_build = api_call('get', url, get_headers(@token))
+  <p>VS Code connection details are not ready.
+     Refresh My Interactive Sessions.</p>
 
-  resources = Array(fresh_build["resources"])
-  warn "OOD DEBUG fresh_resources=#{resources.map { |r| [r['name'], r.keys] }.inspect}"
-
-  coder_output_hash = read_coder_output(fresh_build)
-  warn "OOD DEBUG fresh_output=#{coder_output_hash.inspect}"
-end
+<% end %>

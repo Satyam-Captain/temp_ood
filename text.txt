@@ -1,0 +1,16 @@
+
+warn "OOD DEBUG original=#{coder_output_hash.inspect}"
+
+resources = Array(latest_build["resources"])
+warn "OOD DEBUG original_resources=#{resources.map { |r| [r['name'], r.keys] }.inspect}"
+
+if coder_output_hash.empty? && latest_build["id"]
+  url = "#{@host}/api/v2/workspacebuilds/#{latest_build['id']}"
+  fresh_build = api_call('get', url, get_headers(@token))
+
+  resources = Array(fresh_build["resources"])
+  warn "OOD DEBUG fresh_resources=#{resources.map { |r| [r['name'], r.keys] }.inspect}"
+
+  coder_output_hash = read_coder_output(fresh_build)
+  warn "OOD DEBUG fresh_output=#{coder_output_hash.inspect}"
+end

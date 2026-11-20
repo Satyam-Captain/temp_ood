@@ -1,25 +1,234 @@
+VS Code Integration with Open OnDemand and Coder
+
+Multiuser launch and persistent workspace storage
+
+This runbook reconstructs the VS Code integration from the Three Day Plan and Fix Dynamic Connect Button project chats. It explains the changes in execution order, shows how each layer hands off to the next, and distinguishes the pilot results from the checks still needed before broader rollout.
+
+Pilot result  Open OnDemand launched VS Code workspaces under separate Coder owners and generated working Connect links using runtime ports. A same-owner pilot also retained a test file after a normal Open OnDemand Delete and fresh launch. Different-owner storage isolation and a passwordless launch were not confirmed in the available evidence.
+
+Launch and connection flow
+
+1. Open OnDemand authenticates the user and submits the app.
+2. The adapter maps the Linux account to a Coder workspace owner.
+3. Coder runs the selected template and starts code-server in Podman.
+4. Podman assigns a host port for the container's port 8080.
+5. Coder exposes the proxy host and assigned port as build metadata.
+6. The adapter passes both values to the Open OnDemand Connect view.
+
+What each component owns
+
+Open OnDemand  The app form collects inputs. The submission template selects the Coder template version. The connection view turns the session host and port into the browser link.
+
+Ruby adapter  This translates Open OnDemand actions into Coder API requests and reads the current build to supply connection details. It also handles the stop/delete action exposed by the app.
+
+Coder template and Podman  Terraform defines the workspace, port mapping and home mount. Podman runs the container and stores the externally managed volume separately from it.
+
+Reading the examples  Code blocks are sanitized behavioral excerpts, not complete files. Replace placeholders with approved local values. No internal addresses, account identifiers, credentials or screenshots are included.
+
+1 Set up the application and template
+
+The pilot copied the working bc_coder Batch Connect app into a dedicated bc_vscode app. It also duplicated the working Jupyter Coder template as vscode-podman. The two services retained separate templates and connection views.
+
+Open OnDemand app files
+
+manifest.yml  The Dashboard reads the tile name, category, icon and Batch Connect role. Register the new app as VS Code.
+
+form.yml  The Dashboard renders its workspace-name field and uses the configured coder cluster.
+
+submit.yml.erb  Open OnDemand renders script.native for the adapter, passing the organization, pinned version and workspace name. The app’s template/script.sh.erb is a placeholder: the adapter calls Coder rather than executing that shell script.
+
+view.html.erb  Open OnDemand renders this file on the interactive-session card. Use /rnode/<HOST>/<PORT>/ for VS Code. The alternate /node route returned 401 in the earlier test; do not change Jupyter’s route as part of this fix.
+
+clusters.d/coder.yml  Open OnDemand reads the adapter selection and Coder API configuration here. Treat credentials as protected deployment configuration, not values to put in a copyable example.
+
+Coder template and runtime
+
+main.tf defines the container and mount used by the Docker Terraform provider against the rootless Podman socket. Keep the Coder agent initialization, replace the Jupyter image with an approved code-server image and drop the Jupyter-specific runtime mount. The agent startup script starts code-server.
+
+# Inside the existing coder_script app resource:
+script = "exec code-server --bind-addr 0.0.0.0:8080"
+
+The listener above is inside the container. Limit the host’s published socket to loopback on the same host as the OOD proxy. First prove the workspace is running, the Coder agent is connected and the browser can reach the app. The original fixed host port was only a single-workspace baseline.
+
+2 Map launches to the right owner
+
+coder.rb is the Open OnDemand job-adapter entry point; coder/batch.rb implements the Coder API calls. The batch client originally used the service account as both API caller and workspace owner. The fix kept the API credential separate from the owner.
+
+Derive the owner from the OS account
+
+In the adapter, determine the Linux login from the effective process UID. By default, use that login as the Coder username. Keep a trusted, administrator-maintained exception list only for accounts whose names do not match. Log or reject an unresolvable mapping; never substitute the service account as owner.
+
+def coder_owner
+  linux_user = Etc.getpwuid(Process.euid).name
+  exceptions = { '<LINUX_LOGIN>' => '<CODER_USERNAME>' }
+  exceptions.fetch(linux_user, linux_user)
+end
+
+Apply it on both API paths
+
+POST /api/v2/organizations/<ORG_ID>/members/<CODER_OWNER>/workspaces
+GET  /api/v2/users/<CODER_OWNER>/workspace/<WORKSPACE_NAME>
+     ?include_deleted=true
+
+The same resolved coder_owner must drive creation and lookup. Otherwise creation can succeed under one account while status or deletion looks in another account. One typo, code_owner instead of coder_owner, passed Ruby syntax checks but failed at runtime. After correcting the spelling, test a real submit and lookup.
+
+Check that each mapped account already exists in Coder and can use the shared template; no account is provisioned automatically. Older workspaces created under the service owner do not change ownership when this code changes.
+
+Validation  A colleague’s launch landed under the colleague’s Coder owner account rather than the service owner. The later chat reports multiple users could connect. Neither result by itself proves that users cannot reach each other’s backend routes or files.
+
+3 Publish the assigned port
+
+In main.tf, leave the internal code-server port at 8080 and remove the explicit fixed external port from the docker_container.workspace port block. Keep the approved host-side binding. Podman then allocates an available host port for each container.
+
+ports {
+  internal = 8080
+  ip       = "127.0.0.1"
+  # No explicit external port: Podman assigns one.
+}
+
+# Inside the existing coder_metadata block:
+item {
+  key   = "port"
+  value = tostring(docker_container.workspace[0].ports[0].external)
+}
+
+Keep the existing floating_ip metadata key. In this integration it carries the host value expected by the Open OnDemand proxy; its name does not mean that a public or floating address was provisioned.
+
+Why the unchanged host disappeared
+
+The metadata block originally pointed at null_resource.coder_output. Referencing the container's assigned port added another Terraform dependency. In the Coder version inspected, the converter associates the metadata block with the nearest resource in the dependency graph and breaks equal-depth ties by resource label. In the pilot, Coder displayed both floating_ip and port on docker_container.workspace, not just the port.
+
+The adapter still only read coder_output, so its result was empty. The host therefore vanished and the legacy fallback used port 80, yielding a link shaped like /rnode//80/. Waiting or re-fetching the same build did not make those fields reappear on the old resource.
+
+4 Fix the Connect metadata lookup
+
+In coder/batch.rb, info(id) supplies ood_connection_info from the latest Coder build. Keep the legacy coder_output lookup first. If it has no metadata, look for workspace of type docker_container and accept it only when both expected keys exist.
+
 def read_coder_output(latest_build)
   resources = Array(latest_build["resources"])
-
-  metadata = resources.find { |r|
-    r["name"] == "coder_output"
-  }&.dig("metadata")
+  metadata = resources.find { |r| r["name"] == "coder_output" }&.dig("metadata")
 
   if Array(metadata).empty?
-    workspace = resources.find { |r|
-      r["name"] == "workspace" &&
-      r["type"] == "docker_container"
-    }
-
+    workspace = resources.find do |r|
+      r["name"] == "workspace" && r["type"] == "docker_container"
+    end
     candidate = Array(workspace&.dig("metadata"))
     keys = candidate.map { |m| m["key"] }
-
-    if %w[floating_ip port].all? { |k| keys.include?(k) }
-      metadata = candidate
-    end
+    metadata = candidate if %w[floating_ip port].all? { |k| keys.include?(k) }
   end
 
-  Array(metadata).to_h { |m|
-    [m["key"].to_sym, m["value"]]
-  }
+  Array(metadata).to_h { |m| [m["key"].to_sym, m["value"]] }
 end
+
+Remove the port-80 fallback from the connection data. Return host: coder_output_hash[:floating_ip] and port: coder_output_hash[:port]&.to_i. In view.html.erb, offer Connect only with the expected loopback host and an eligible port; otherwise show “connection details are not ready.” The pilot’s display guard allowed ports 1024–65535. That display check is not backend authorization.
+
+Validate after reloading the adapter
+
+Back up the installed batch.rb, check the staged edit with ruby -c, deploy the edit, and use the affected OOD user’s Restart Web Server action. Compare the real Podman port, Coder metadata and rendered link. Avoid adding sleeps in info: refresh was already happening, but the adapter was reading the wrong resource.
+
+Pilot result  Ruby syntax passed, then the user confirmed both automatic Connect and functional multiuser use. Preserve and regression-test the Jupyter legacy path.
+
+5 Keep home storage after workspace deletion
+
+Open OnDemand exposed Delete rather than a simple Stop for the session. The adapter requested Coder workspace deletion, so resources owned by that workspace could be destroyed. A workspace-ID volume or a Terraform-managed volume tied to that workspace would not meet the requirement to recover work in a fresh workspace.
+
+Use an external volume keyed to the owner
+
+Use one Podman named volume per immutable Coder owner ID, managed outside the workspace’s Terraform lifecycle. Attach it as /home/coder, the home directory used by the container runtime and code-server user. The same Coder owner resolves to the same volume name on a new launch.
+
+# Sanitized mount excerpt inside docker_container.workspace:
+volumes {
+  volume_name   = "ood-vscode-${data.coder_workspace_owner.me.id}"
+  container_path = "/home/coder"
+}
+
+Verify the final prefix and actual owner ID before provisioning or restoring data. A test with the wrong volume name can appear to pass in a helper container while the OOD workspace mounts a different, empty volume. Use the same Podman endpoint and identity that Coder uses, and the exact VS Code image.
+
+Back up and verify before cutover
+
+1. Save the old container home to an approved, protected backup location before changing the mount. Verify the archive is readable. An empty mount can hide files in the container's original home.
+
+2. Test a disposable named volume with the intended runtime UID and GID. Write a marker, remove the test container, attach the volume to a second disposable container and read it back.
+
+3. Prepare the pilot owner's actual volume and restore the backed-up home with the intended ownership. Before publishing, verify a known restored file and a fresh writable marker through the mount. The pilot check reported .bashrc and persist-test.
+
+Storage validation command examples
+
+These examples target a disposable volume and assume the correct rootless Podman context is already selected. Replace <APPROVED_VS_CODE_IMAGE> with the exact image used by the workspace. Verify the image and effective UID/GID; the pilot tested 1000:1000.
+
+podman volume create ood-vscode-test
+
+podman run --rm --network none -u 1000:1000 --entrypoint sh \
+  -v ood-vscode-test:/home/coder <APPROVED_VS_CODE_IMAGE> \
+  -c 'touch /home/coder/probe && echo WRITE_OK'
+
+podman run --rm --network none -u 1000:1000 --entrypoint sh \
+  -v ood-vscode-test:/home/coder <APPROVED_VS_CODE_IMAGE> \
+  -c 'test -f /home/coder/probe && echo PERSIST_OK'
+
+podman volume inspect ood-vscode-test
+
+The volume inspection shows its actual backing mountpoint. Verify that the filesystem cleaner excludes that location and separately confirm whether scheduled Podman prune can remove inactive named volumes. Neither check replaces backup and restore.
+
+Restore only into the intended pilot volume
+
+Inspect the archive layout first. If it contains one leading home directory, extract into the correct owner’s mounted home with that directory stripped. If the archive already contains home-relative paths, omit stripping. Verify a restored non-secret file and perform a write test before switching the OOD pin.
+
+podman run --rm -i --network none -u 1000:1000 \
+  -v "$VOL:/home/coder" --entrypoint tar <APPROVED_VS_CODE_IMAGE> \
+  -xzf - -C /home/coder --strip-components=1 < "$VERIFIED_BACKUP"
+
+Use an approved backup location accessible only to authorized operators. Do not extract an unverified archive or recursively change ownership on a populated home as a generic fix.
+
+6 Publish and test end to end
+
+Pin the version used by Open OnDemand
+
+Build and validate the edited Coder template, then publish it. Get the published template version ID, not just the parent template ID. Update the VS Code app’s pin in submit.yml.erb; publication alone did not change an explicit older pin. A newly launched pilot should report the expected version in its Coder build.
+
+batch_connect:
+  template: basic
+script:
+  native:
+    org_id: "<CODER_ORGANIZATION_ID>"
+    template_version_id: "<PUBLISHED_VS_CODE_TEMPLATE_VERSION_ID>"
+    workspace_name: "<%= workspace_name %>"
+    project_id: ""
+
+Reproduce the acceptance tests
+
+A. Ownership and concurrency  Launch as two approved pilot owners. Verify each Coder workspace has the expected owner, the two host ports differ, and both Connect links open their own workspace. The pilot reported separate owners, distinct ports and working multiuser Connect.
+
+B. Same-owner persistence  In one pilot workspace, write a disposable marker into the mounted home. Use normal OOD Delete, then launch a fresh VS Code workspace under the same owner and read the marker. The pilot reported that ood-persistence-test.txt survived this sequence.
+
+C. Different-owner storage  Verify each owner has a different mounted volume. Confirm each can write and read its own marker, and neither can access the other's files through the approved interface. This was not established by the same-owner test.
+
+D. Restart and regression  Verify a recreated container's Connect link uses its current port, and that the unchanged Jupyter launch/connect path still works. These were not independently confirmed in the post-fix evidence.
+
+Dependency persistence  Files stored under the mounted home persist; packages installed into the container’s writable system layer do not reliably survive recreation. Use a project venv under the mounted home and record its dependencies. If no Python interpreter exists, pip is not a way to install the interpreter; put that runtime in a vetted image or provision it explicitly.
+
+7 Cybersecurity concerns before rollout
+
+Treat the successful launch as a functional proof of concept, not a security sign-off. Require all of the following before broadening access.
+
+1. Authorize access per workspace  Open OnDemand login proves identity, not permission to reach every proxied host and port. Bind Connect and the backend proxy decision to the authenticated user, workspace owner and current build. Use approved target restrictions and keep the backend off directly reachable network interfaces. Validate rejected cross-user access through an approved two-account test.
+
+2. Keep application authentication  A code-server password prompt was observed. No passwordless flow was confirmed. Keep application authentication until an approved owner-aware gateway or equivalent SSO route enforces access. Do not disable authentication merely because the link is behind an Open OnDemand login. Keep credentials out of URLs, metadata, logs, screenshots and documents. Use a trusted TLS certificate and confirm the browser shows no trust warning.
+
+3. Limit the adapter credential  Use least-privilege scope, approved secret storage, restrictive access and a rotation/revocation procedure. Derive the owner server-side, validate that the mapping is unique and legitimate, and make create, look up, connect and delete enforce the same ownership boundary. Never accept an owner or proxy destination straight from a form.
+
+4. Separate and protect storage  Verify the actual owner mount, runtime UID/GID and storage permissions. Do not share one volume across different owners or grant workspace containers access to the Podman API socket. Keep backups encrypted and access-controlled. Check scheduled Podman prune separately from filesystem cleanup, and verify recovery with a restore drill.
+
+5. Control images and changes  Pin an approved image and provider versions; review and scan updates, extensions and dependencies. Avoid privileged containers. Audit launch, connect and delete events with user and workspace identifiers but without credentials. Validate a template change in a pilot before moving the OOD pin.
+
+8 Troubleshooting and rollback
+
+Connect absent or incorrectly uses port 80  Inspect the current Coder build’s workspace and coder_output resources. Confirm both metadata keys are on the expected resource and that the Ruby process loaded the edited adapter. Compare the actual host port against the generated URL.
+
+Workspace appears under a shared owner  Verify the effective Linux login and exception mapping, then check that creation and lookup use coder_owner. Exercise both API operations; syntax checks cannot catch a wrong variable name in an untested branch.
+
+Old files or marker missing after a new launch  Check the template version that actually ran, the exact owner-derived volume name and the container’s home mount. Check the original backup and destination before any restore. Do not restore blindly or delete volumes to make a failed test pass.
+
+Home writes fail  Run a disposable test with the exact image and runtime identity; inspect UID/GID mappings, mount ownership and SELinux policy. Distinguish unrelated platform warnings from an actual failed write. Do not apply broad recursive ownership changes to a live home.
+
+Rollback  Restore the previous known-good adapter revision and VS Code version pin for new test sessions if necessary. Preserve externally managed owner volumes and backups. Confirm that any fallback template without the mount will not give the false impression that retained files have been deleted.
